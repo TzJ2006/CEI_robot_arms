@@ -2,22 +2,57 @@
 
 It does not send end-pose, joint, or gripper commands. Finish with a key:
 s = success, f = failure, d = discard. Ctrl+C stores the episode as interrupted.
+Runs on Windows (DirectShow, msvcrt) and macOS (AVFoundation, terminal in
+cbreak mode so a single key is read without Enter).
 """
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
 import cv2
-import msvcrt
 import pandas as pd
 
 from piper_client import PiperClient
-from policy_link import color_camera_index
+from policy_link import open_policy_camera
 
 SCHEMA_VERSION = 1
 CAMERA_ID = "vid_2bc5_pid_0501"
+
+
+class KeyReader:
+    """Non-blocking single-key reads from the terminal on Windows and macOS/Linux."""
+
+    def __enter__(self):
+        self._saved = None
+        if sys.platform != "win32" and sys.stdin.isatty():
+            import termios
+            import tty
+
+            self._saved = termios.tcgetattr(sys.stdin)
+            # cbreak keeps Ctrl+C working while delivering keys without Enter.
+            tty.setcbreak(sys.stdin.fileno())
+        return self
+
+    def __exit__(self, *exc):
+        if self._saved is not None:
+            import termios
+
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._saved)
+
+    def key(self):
+        """Return one lowercase key if pressed, else None."""
+        if sys.platform == "win32":
+            import msvcrt
+
+            return msvcrt.getwch().lower() if msvcrt.kbhit() else None
+        import select
+
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1).lower()
+        return None
 
 
 def _clock(origin):
@@ -60,9 +95,9 @@ def _write_metadata(path, payload):
 
 def record_episode(task, out_dir, seconds=None):
     print("keys: s success, f failure, d discard. Drag the arm; this program only reads.", flush=True)
-    capture = cv2.VideoCapture(color_camera_index(), cv2.CAP_DSHOW)
+    capture, camera_index = open_policy_camera()
     if not capture.isOpened():
-        raise RuntimeError("could not open the Astra Pro color camera")
+        raise RuntimeError(f"could not open the Astra Pro color camera at index {camera_index}")
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
@@ -110,50 +145,51 @@ def record_episode(task, out_dir, seconds=None):
     success = None
     error = None
     last_image_t = None
-    try:
-        while True:
-            grabbed = capture.grab()
-            t_image = _clock(origin)
-            ok, frame = capture.retrieve() if grabbed else (False, None)
-            if ok and frame is not None:
-                if last_image_t is not None and t_image - last_image_t > 0.15:
-                    metadata["camera_gaps"] += 1
-                last_image_t = t_image
-                name = f"{len(images):06d}.jpg"
-                if cv2.imwrite(str(image_dir / name), frame):
-                    images.append({"index": len(images), "t_image": t_image, "file": f"images/{name}"})
+    with KeyReader() as keys:
+        try:
+            while True:
+                grabbed = capture.grab()
+                t_image = _clock(origin)
+                ok, frame = capture.retrieve() if grabbed else (False, None)
+                if ok and frame is not None:
+                    if last_image_t is not None and t_image - last_image_t > 0.15:
+                        metadata["camera_gaps"] += 1
+                    last_image_t = t_image
+                    name = f"{len(images):06d}.jpg"
+                    if cv2.imwrite(str(image_dir / name), frame):
+                        images.append({"index": len(images), "t_image": t_image, "file": f"images/{name}"})
+                    else:
+                        metadata["image_write_failures"] += 1
                 else:
-                    metadata["image_write_failures"] += 1
-            else:
-                metadata["camera_read_failures"] += 1
-            state = robot.read_state(timeout=0.05)
-            t_robot = _clock(origin)
-            if state["complete"]:
-                feedback.append(_feedback_row(state, t_robot))
-            else:
-                metadata["incomplete_reads"] += 1
-            if seconds is not None and _clock(origin) >= seconds:
-                reason = "smoke"
-                break
-            if msvcrt.kbhit():
-                key = msvcrt.getwch().lower()
-                if key == "s":
-                    reason, success = "success", True
+                    metadata["camera_read_failures"] += 1
+                state = robot.read_state(timeout=0.05)
+                t_robot = _clock(origin)
+                if state["complete"]:
+                    feedback.append(_feedback_row(state, t_robot))
+                else:
+                    metadata["incomplete_reads"] += 1
+                if seconds is not None and _clock(origin) >= seconds:
+                    reason = "smoke"
                     break
-                if key == "f":
-                    reason, success = "failure", False
-                    break
-                if key == "d":
-                    reason, success = "discard", None
-                    break
-    except KeyboardInterrupt:
-        reason, success = "interrupted", None
-    except Exception as exc:
-        reason, success = "error", None
-        error = exc
-    finally:
-        capture.release()
-        robot.close()
+                key = keys.key()
+                if key is not None:
+                    if key == "s":
+                        reason, success = "success", True
+                        break
+                    if key == "f":
+                        reason, success = "failure", False
+                        break
+                    if key == "d":
+                        reason, success = "discard", None
+                        break
+        except KeyboardInterrupt:
+            reason, success = "interrupted", None
+        except Exception as exc:
+            reason, success = "error", None
+            error = exc
+        finally:
+            capture.release()
+            robot.close()
 
     metadata["success"] = success
     metadata["termination_reason"] = reason

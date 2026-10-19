@@ -12,11 +12,19 @@ rejects targets near the folded rest pose (TARGET_EXCEEDS_LIMIT).
 --mode nudge replies with the (50, 12) end-effector delta chunk from
 policy_step.action_waypoints(): +X by AMPLITUDE_MM and back.
 
+--mode replay --episode PATH plays a drag-teach episode as joint chunks: first
+a slow move to the recording's first frame, then --chunk steps per reply. At
+the end it replies {"done": True}, or starts over with --loop. PATH is an
+episode folder from episode_recorder.py (needs pandas) or the .npz that
+team_config.py setup-remote makes from one, so the server needs no pandas.
+
     python simple_policy_server.py --port 8000
+    python simple_policy_server.py --port 8000 --mode replay --episode episodes/episode_20261019_160000
 """
 
 import argparse
 import socket
+from pathlib import Path
 
 import numpy as np
 import websockets.sync.server
@@ -89,7 +97,85 @@ def demo_chunk(cycle, joints):
     return name, keyframe_chunk(joints, keyframes)
 
 
-def handle_connection(websocket, mode="demo"):
+# Same step length as policy_step.STEP_SECONDS; this file runs on the server without policy_step.
+STEP_SECONDS = 0.05
+# Gripper openings below this count as closed (column 6 = 1.0); same as dataset_export.GRIPPER_CLOSE_MM.
+CLOSE_BELOW_MM = 5.0
+
+
+def episode_arrays(path):
+    """(joints_deg (N, 6), gripper_mm (N,), t (N,)) from an episode folder or a replay .npz."""
+    path = Path(path)
+    if path.is_dir():
+        import pandas as pd
+
+        feedback = pd.read_parquet(path / "robot_feedback.parquet").sort_values("t_robot")
+        joints = feedback[[f"j{i}_deg" for i in range(1, 7)]].to_numpy(dtype=float)
+        return joints, feedback["gripper_mm"].to_numpy(dtype=float), feedback["t_robot"].to_numpy(dtype=float)
+    data = np.load(path)
+    return (
+        np.asarray(data["joints_deg"], dtype=float),
+        np.asarray(data["gripper_mm"], dtype=float),
+        np.asarray(data["t"], dtype=float),
+    )
+
+
+def write_replay_npz(episode_dir, destination):
+    """Save the arrays replay needs from an episode folder, for a server without pandas."""
+    joints, gripper, stamps = episode_arrays(episode_dir)
+    if len(stamps) < 2:
+        raise ValueError(f"{episode_dir} has fewer than two arm feedback samples")
+    np.savez(destination, joints_deg=joints.astype(np.float32), gripper_mm=gripper.astype(np.float32), t=stamps.astype(np.float32))
+
+
+def episode_rows(path, close_below_mm=CLOSE_BELOW_MM):
+    """Resample a recording onto 0.05 s steps. Returns (N, 7) joint targets plus gripper.
+
+    Steps that move a joint more than PEAK_STEP_DEG (the hand moved faster than
+    the 3 deg/step cap allows) are split, so those parts replay slower.
+    """
+    joints, gripper, stamps = episode_arrays(path)
+    grid = np.arange(stamps[0], stamps[-1] + 1e-9, STEP_SECONDS)
+    resampled = np.stack([np.interp(grid, stamps, joints[:, i]) for i in range(6)], axis=1)
+    closed = (np.interp(grid, stamps, gripper) < close_below_mm).astype(float)
+    rows = [np.concatenate([resampled[0], [closed[0]]])]
+    for index in range(1, len(grid)):
+        previous = rows[-1][:6]
+        pieces = max(1, int(np.ceil(np.max(np.abs(resampled[index] - previous)) / PEAK_STEP_DEG)))
+        for piece in range(1, pieces + 1):
+            rows.append(np.concatenate([previous + (resampled[index] - previous) * piece / pieces, [closed[index]]]))
+    return np.asarray(rows, dtype=np.float32)
+
+
+class Replay:
+    """Hands out one recording chunk per observation, bridging from wherever the arm is."""
+
+    def __init__(self, rows, chunk_steps, loop):
+        self.rows = rows
+        self.chunk_steps = chunk_steps
+        self.loop = loop
+        self.position = 0
+        self.passes = 1
+
+    def next_chunk(self, joints):
+        if self.position >= len(self.rows):
+            if not self.loop:
+                return None, None
+            self.position = 0
+            self.passes += 1
+        piece = self.rows[self.position:self.position + self.chunk_steps]
+        start = self.position
+        self.position += len(piece)
+        name = f"replay pass={self.passes} steps={start}-{self.position}/{len(self.rows)}"
+        first = piece[0]
+        if np.max(np.abs(first[:6] - np.asarray(joints, dtype=float))) <= PEAK_STEP_DEG:
+            return name, piece
+        # Arm is away from the recording (first chunk, a loop restart, or lag): move there slowly first.
+        bridge = keyframe_chunk(joints, [(first[:6], first[6])], peak_step_deg=PEAK_STEP_DEG / 2)
+        return name + f" bridge={len(bridge)}", np.concatenate([bridge, piece[1:]])
+
+
+def handle_connection(websocket, mode="demo", replay=None):
     websocket.send(
         packb(
             {
@@ -116,6 +202,14 @@ def handle_connection(websocket, mode="demo"):
                 name, actions = demo_chunk(cycle, observation["observation/joints_deg"])
                 print(f"routine={name} steps={len(actions)}", flush=True)
                 reply = {"actions": actions, "action_space": "joints"}
+            elif mode == "replay":
+                name, actions = replay.next_chunk(observation["observation/joints_deg"])
+                if actions is None:
+                    print("replay finished", flush=True)
+                    reply = {"actions": np.zeros((0, 7), dtype=np.float32), "action_space": "joints", "done": True}
+                else:
+                    print(f"routine={name} steps={len(actions)}", flush=True)
+                    reply = {"actions": actions, "action_space": "joints"}
             else:
                 reply = {"actions": scripted_chunk(cycle), "action_space": "ee_delta"}
         except Exception as exc:
@@ -128,11 +222,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--mode", choices=("demo", "nudge"), default="demo")
+    parser.add_argument("--mode", choices=("demo", "nudge", "replay"), default="demo")
+    parser.add_argument("--episode", help="episode folder from episode_recorder.py, or its replay .npz, for --mode replay")
+    parser.add_argument("--chunk", type=int, default=50, help="replay steps per reply (0.05 s each)")
+    parser.add_argument("--loop", action="store_true", help="replay: start over instead of finishing")
     args = parser.parse_args()
+    rows = None
+    if args.mode == "replay":
+        if not args.episode:
+            parser.error("--mode replay needs --episode")
+        rows = episode_rows(Path(args.episode))
+        print(f"episode={args.episode} steps={len(rows)} seconds={len(rows) * STEP_SECONDS:.1f}", flush=True)
 
     def handler(websocket):
-        handle_connection(websocket, args.mode)
+        # Each connection replays from the start.
+        replay = Replay(rows, args.chunk, args.loop) if rows is not None else None
+        handle_connection(websocket, args.mode, replay)
 
     with websockets.sync.server.serve(handler, args.host, args.port, compression=None, max_size=None) as server:
         print(f"listening on {args.host}:{args.port} host={socket.gethostname()} mode={args.mode}", flush=True)

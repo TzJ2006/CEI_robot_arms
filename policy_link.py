@@ -195,6 +195,19 @@ def _configured_camera_index():
     )
 
 
+def policy_camera_index():
+    """Astra Pro index on this platform: DirectShow by USB ID on Windows, AVFoundation (or camera_index) elsewhere."""
+    if sys.platform == "win32":
+        return color_camera_index()
+    return _configured_camera_index()
+
+
+def open_policy_camera():
+    """Open the Astra Pro with this platform's capture backend. Returns (capture, index)."""
+    index = policy_camera_index()
+    return _open_capture(index), index
+
+
 def _open_capture(index):
     import cv2
 
@@ -242,7 +255,7 @@ def capture_color_bgr():
     """Return one BGR frame from the Astra Pro color camera."""
     import cv2
 
-    index = color_camera_index() if sys.platform == "win32" else _configured_camera_index()
+    index = policy_camera_index()
     capture = _open_capture(index)
     if not capture.isOpened():
         raise RuntimeError(f"could not open Astra Pro color camera at index {index}")
@@ -266,7 +279,7 @@ def preview(index=None):
     import cv2
 
     if index is None:
-        index = color_camera_index() if sys.platform == "win32" else _configured_camera_index()
+        index = policy_camera_index()
     capture = _open_capture(index)
     if not capture.isOpened():
         raise RuntimeError(f"could not open camera {index}")
@@ -414,7 +427,13 @@ def _apply_in_subprocess(actions, action_space="ee_delta", speed=None, freq=None
         command += ["--speed", str(speed)]
     if freq is not None:
         command += ["--freq", str(freq)]
-    subprocess.check_call(command)
+    code = subprocess.call(command)
+    # policy_step.REFUSED_EXIT: a limit check refused the chunk and nothing was sent; observe again.
+    if code == 3:
+        return False
+    if code != 0:
+        raise subprocess.CalledProcessError(code, command)
+    return True
 
 
 def _connect_policy(host, port):
@@ -437,8 +456,44 @@ def _recv_actions(websocket):
     return result, np.asarray(result["actions"])
 
 
-def infer_once(host, port, speed=None, freq=None):
-    """Read, infer, and execute until Ctrl+C. The server connection stays open."""
+# Piper's zero position is its folded rest pose.
+HOME_DEG = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+
+def go_to(target_deg, label, speed=None, freq=None):
+    """Move to target_deg with joint targets at half the demo speed, gripper open."""
+    from simple_policy_server import OPEN, PEAK_STEP_DEG, keyframe_chunk
+
+    with PiperClient() as robot:
+        state = robot.read_state()
+    if not state["complete"]:
+        raise RuntimeError("arm feedback is incomplete")
+    actions = keyframe_chunk(state["joints_deg"], [(target_deg, OPEN)], peak_step_deg=PEAK_STEP_DEG / 2)
+    print(f"{label} steps={len(actions)}", flush=True)
+    if not _apply_in_subprocess(actions, "joints", speed=speed, freq=freq):
+        raise RuntimeError(f"the move to the {label} pose was refused; move the arm closer by hand first")
+
+
+def go_ready(speed=None, freq=None):
+    """Unfold to simple_policy_server.READY_DEG.
+
+    End-pose chunks are rejected near the folded rest pose (TARGET_EXCEEDS_LIMIT),
+    so run this before an ee_delta model.
+    """
+    from simple_policy_server import READY_DEG
+
+    go_to(READY_DEG, "ready", speed=speed, freq=freq)
+
+
+def go_home(speed=None, freq=None):
+    """Fold back to HOME_DEG, the rest pose. The arm stays enabled and holds there."""
+    go_to(HOME_DEG, "home", speed=speed, freq=freq)
+
+
+def infer_once(host, port, speed=None, freq=None, ready=False):
+    """Read, infer, and execute until Ctrl+C or the server says done. The server connection stays open."""
+    if ready:
+        go_ready(speed=speed, freq=freq)
     connection = _connect_policy(host, port)
     with connection as websocket:
         metadata = unpackb(websocket.recv(timeout=30))
@@ -461,6 +516,9 @@ def infer_once(host, port, speed=None, freq=None):
                 websocket.send(packb(observation))
                 print("waiting_for_inference", flush=True)
                 result, actions = _recv_actions(websocket)
+                if result.get("done"):
+                    print("server_done", flush=True)
+                    break
                 action_space = str(result.get("action_space", "ee_delta"))
                 print(f"actions_shape={tuple(actions.shape)} action_space={action_space}", flush=True)
                 print("applying", flush=True)
@@ -471,10 +529,11 @@ def infer_once(host, port, speed=None, freq=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("serve", "once", "cameras", "preview"))
+    parser.add_argument("mode", choices=("serve", "once", "cameras", "preview", "ready", "home"))
     parser.add_argument("--index", type=int, help="camera index for preview; default is the policy camera")
     parser.add_argument("--speed", type=int, help="joint speed percent for joint actions; default joint_speed in team_config.json")
     parser.add_argument("--freq", type=float, help="joint target updates per second; 20 holds one target per step; default 100")
+    parser.add_argument("--ready", action="store_true", help="once: unfold to the ready pose before the first observation")
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int)
     args = parser.parse_args()
@@ -483,6 +542,12 @@ def main():
         return
     if args.mode == "preview":
         preview(args.index)
+        return
+    if args.mode == "ready":
+        go_ready(speed=args.speed, freq=args.freq)
+        return
+    if args.mode == "home":
+        go_home(speed=args.speed, freq=args.freq)
         return
     port = args.port
     if port is None:
@@ -494,7 +559,7 @@ def main():
     if args.mode == "serve":
         serve(args.host, port)
     else:
-        infer_once(args.host, port, speed=args.speed, freq=args.freq)
+        infer_once(args.host, port, speed=args.speed, freq=args.freq, ready=args.ready)
 
 
 if __name__ == "__main__":
