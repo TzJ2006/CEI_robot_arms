@@ -29,6 +29,7 @@ flowchart LR
 | Read the printed numbers | [What the output means](#what-the-output-means) |
 | Look up an error | [When something fails](#when-something-fails) |
 | Pause this run, or stop the server | [Stop this test](#stop-this-test) |
+| Record a demonstration by dragging the arm | [Record a demonstration](#record-a-demonstration) |
 | Power off the arm after use | [After you finish](#after-you-finish) |
 
 ## Before you start
@@ -57,6 +58,23 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 
 `--freq` is how many times per second the joint target changes (default 100; 20 is the old stepwise behavior). `--speed` is the joint speed percent (default `joint_speed` in `team_config.json`). Each chunk prints the values it used.
 
+### Replay a recording from the server
+
+1. Record a demonstration as in [Record a demonstration](#record-a-demonstration). Any episode can be replayed, not only ones marked `s`.
+2. Set `replay_episode` to that folder (for example `episodes/episode_20261019_160000`) and copy it to the server: `.venv/bin/python team_config.py setup-remote`. It uploads the joint angles and gripper as an `.npz`, so the server needs no pandas.
+3. Leave drag-teach, then run `.venv/bin/python team_config.py run --server replay`. The first chunk moves slowly to the recording's first pose; then each chunk plays the next 2.5 s. Parts moved by hand faster than about 48 degrees/s replay slower. The run ends with `server_done`. Add `--loop` to the server command in `team_config.py` to repeat it.
+
+### Run the model
+
+`--server openpi` serves the checkpoint in `checkpoint_dir` with `openpi_python` on a GPU; `mode_overrides.openpi` holds its partition, memory, and time. The first reply can take minutes while the model compiles.
+
+```bash
+.venv/bin/python team_config.py down
+.venv/bin/python team_config.py run --server openpi --ready
+```
+
+`--ready` unfolds the arm to the ready pose first, because end-pose chunks from the folded pose only move the gripper. This model was trained in simulation: its full 50-step chunk integrates to 0.3–1.5 m, far more than the simulated arm moved. `execute_steps` (here 10) keeps only the first steps and `ee_delta_scale` (here 0.1) shrinks each one; with these, about 3 of 4 chunks stay within `max_chunk_shift_mm`. A chunk outside it prints `chunk_refused`, sends nothing, and the loop observes again. Expect small motions, not a finished task. Switching between `simple`, `replay`, and `openpi` needs `down` first; `run` refuses a job started in another mode. `.venv/bin/python policy_link.py ready` only unfolds the arm. `.venv/bin/python policy_link.py home` folds it back to the rest pose (all joints 0) at the same slow speed, gripper open; it needs no server. A move of more than `max_chunk_joint_deg` is refused; then move the arm closer by hand in drag-teach first.
+
 ## Do not
 
 - Do not run `python piper_client.py`. That command opens the gripper fully and then closes it.
@@ -65,6 +83,37 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 - The language instruction is the `prompt` field in `policy_link.py`. Change that English sentence before a run. There is no separate command-line prompt.
 - Do not install a fresh environment on the compute node. Use the Python already installed under `openpi_dir`.
 - Do not copy a job script or an SSH forward from this guide onto the login node. `run`, `once`, and `down` connect by themselves.
+- Do not run `run` or `once` while recording a demonstration. The camera is busy.
+
+## Record a demonstration
+
+This only stores a person dragging the arm. The program reads the arm and the camera and never moves the arm. Turn on drag-teach, then run this in this folder with the task sentence in quotes (on a Mac use `.venv/bin/python` and `/` in paths):
+
+```powershell
+python episode_recorder.py --task "put the pen in the box"
+```
+
+When the attempt is over, press one key in the same window (no Enter needed):
+
+| Key | Result |
+| --- | --- |
+| `s` | Success, can be exported |
+| `f` | Failure, kept but not exported |
+| `d` | Discard |
+
+It prints an `episodes\episode_...` folder. Check it with that name:
+
+```powershell
+python episode_check.py episodes\episode_...
+```
+
+`teaching_fraction` should be close to 1 and `frames_missing` should be 0. Export only episodes marked `s`:
+
+```powershell
+python dataset_export.py episodes\episode_...
+```
+
+The result is in that folder's `export`. Flagged steps are not used for training. The rules are in `数据采集.md`.
 
 ## Run once
 

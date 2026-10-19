@@ -12,8 +12,11 @@ one observation. `once` sends another observation while that forward is up.
 `down` cancels the serve-policy job and closes the local forward.
 
 server_mode "simple" runs simple_policy_server.py from remote_code_dir without
-a GPU; `setup-remote` copies it there and builds its venv. server_mode
-"openpi" runs scripts/serve_policy.py from openpi_dir.
+a GPU; `setup-remote` copies it there and builds its venv. "replay" runs the
+same server on replay_episode (copied by `setup-remote`). "openpi" runs
+scripts/serve_policy.py from openpi_dir with openpi_python on a GPU.
+`--server MODE` overrides server_mode for one command, and mode_overrides.MODE
+replaces Slurm keys for that mode (a model needs more memory than the demo).
 
 Account, code directory, and checkpoint stay in team_config.json.
 """
@@ -62,11 +65,29 @@ def configured_port(config=None):
 SIMPLE_SERVER_FILES = ("simple_policy_server.py", "policy_link.py", "piper_client.py")
 
 
+SERVER_MODES = ("simple", "replay", "openpi")
+
+
 def server_mode(config):
     mode = config.get("server_mode") or "openpi"
-    if mode not in ("simple", "openpi"):
-        raise SystemExit(f'server_mode must be "simple" or "openpi", not {mode!r}')
+    if mode not in SERVER_MODES:
+        raise SystemExit(f'server_mode must be one of {", ".join(SERVER_MODES)}, not {mode!r}')
     return mode
+
+
+def with_mode(config, mode=None):
+    """Apply --server and that mode's entry in mode_overrides."""
+    config = dict(config)
+    if mode:
+        config["server_mode"] = mode
+    config.update((config.get("mode_overrides") or {}).get(server_mode(config), {}))
+    return config
+
+
+def remote_episode(config):
+    """replay_episode is a local episode folder (or .npz); setup-remote puts an .npz in remote_code_dir/episodes/."""
+    require(config, ["replay_episode"])
+    return "episodes/" + Path(config["replay_episode"]).with_suffix(".npz").name
 
 
 def remote_quote(path):
@@ -82,14 +103,19 @@ def remote_quote(path):
 def server_launch(config):
     """Return (directory, command, needs_gpu) for the policy server on the compute node."""
     port = int(config["local_forward_port"])
-    if server_mode(config) == "simple":
+    mode = server_mode(config)
+    if mode in ("simple", "replay"):
         require(config, ["remote_code_dir", "local_forward_port"])
-        return config["remote_code_dir"], f".venv/bin/python simple_policy_server.py --port {port}", False
+        command = f".venv/bin/python simple_policy_server.py --port {port}"
+        if mode == "replay":
+            command += f" --mode replay --episode {shlex.quote(remote_episode(config))}"
+        return config["remote_code_dir"], command, False
     require(config, ["openpi_dir", "policy_config", "checkpoint_dir", "local_forward_port"])
+    python = remote_quote(config.get("openpi_python") or ".venv/bin/python")
     command = (
-        f"{shlex.join(['.venv/bin/python', 'scripts/serve_policy.py', '--port', str(port), 'policy:checkpoint'])} "
+        f"{python} {shlex.join(['scripts/serve_policy.py', '--port', str(port), 'policy:checkpoint'])} "
         f"--policy.config={shlex.quote(str(config['policy_config']))} "
-        f"--policy.dir={shlex.quote(str(config['checkpoint_dir']))}"
+        f"--policy.dir={remote_quote(config['checkpoint_dir'])}"
     )
     return config["openpi_dir"], command, True
 
@@ -111,6 +137,7 @@ def job_script(config):
 sbatch <<EOF
 #!/bin/bash
 #SBATCH --job-name=serve-policy
+#SBATCH --comment={server_mode(config)}
 #SBATCH --partition={config["slurm_partition"]}
 {gres}#SBATCH --cpus-per-task={config["slurm_cpus"]}
 #SBATCH --mem={config["slurm_mem"]}
@@ -160,15 +187,22 @@ SLURM_TIME={shlex.quote(str(config["slurm_time"]))}
 MEM={shlex.quote(str(config["slurm_mem"]))}
 GPUS={int(config["slurm_gpus"])}
 CPUS={int(config["slurm_cpus"])}
+MODE={shlex.quote(server_mode(config))}
 mkdir -p "$LOG_DIR"
-existing=$(squeue -u "$ACCOUNT" -h -n serve-policy -o "%i %T %N" | sed -n '1p' || true)
+existing=$(squeue -u "$ACCOUNT" -h -n serve-policy -o "%i %k" | sed -n '1p' || true)
 if [ -n "$existing" ]; then
   JOB_ID=${{existing%% *}}
+  running_mode=${{existing#* }}
+  if [ "$running_mode" != "$MODE" ]; then
+    echo "serve-policy job $JOB_ID is running server_mode=$running_mode, not $MODE. Run python team_config.py down first."
+    exit 1
+  fi
   echo "submitted_job=$JOB_ID reused=1"
 else
   JOB_ID=$(sbatch --parsable <<EOF
 #!/bin/bash
 #SBATCH --job-name=serve-policy
+#SBATCH --comment=$MODE
 #SBATCH --partition=$PARTITION
 {gres}#SBATCH --cpus-per-task=$CPUS
 #SBATCH --mem=$MEM
@@ -269,11 +303,16 @@ def shell_join(args):
     return " ".join(cmd_quote(arg) for arg in args)
 
 
-def open_tunnel(config, addr):
+def open_tunnel(config, addr, previous_addr=None):
     port = configured_port(config)
     if local_port_open(port):
-        print(f"Local port {port} is already forwarded; reusing it.", flush=True)
-        return
+        if previous_addr == addr:
+            print(f"Local port {port} is already forwarded; reusing it.", flush=True)
+            return
+        # The job moved (new node after down/run); the old forward points at the wrong host.
+        print(f"Local port {port} points at {previous_addr or 'another host'}; reopening it for {addr}.", flush=True)
+        stop_local_tunnels(port)
+        time.sleep(1)
     forward = f"{port}:{addr}:{port}"
     if sys.platform != "win32":
         print("Opening the local forward in the background. Type the SSH password here if asked.", flush=True)
@@ -315,8 +354,14 @@ def up(config):
     ready = parse_ready(output)
     if ready is None or not ready.get("addr"):
         raise SystemExit("The login node did not return a compute-node address. The log above shows why the job exited or timed out.")
+    previous_addr = None
+    if STATE_PATH.exists():
+        try:
+            previous_addr = json.loads(STATE_PATH.read_text(encoding="utf-8")).get("addr")
+        except (OSError, json.JSONDecodeError):
+            pass
     save_state(ready, configured_port(config))
-    open_tunnel(config, ready["addr"])
+    open_tunnel(config, ready["addr"], previous_addr)
 
 
 def once(config, extra=()):
@@ -383,14 +428,29 @@ def scp_target(config):
 
 
 def setup_remote(config):
-    """Copy the simple server to remote_code_dir and build its venv on the login node."""
+    """Copy the simple server (and replay_episode, if set) to remote_code_dir and build its venv."""
     require(config, ["remote_code_dir"])
     directory = config["remote_code_dir"]
-    run_ssh(config, f"set -eu\nmkdir -p {remote_quote(directory)}\n")
+    run_ssh(config, f"set -eu\nmkdir -p {remote_quote(directory)}/episodes\n")
     remote_dir = directory[2:] if directory.startswith("~/") else directory
     files = [str(ROOT / name) for name in SIMPLE_SERVER_FILES]
     if subprocess.call(["scp", *files, f"{scp_target(config)}:{remote_dir}/"]) != 0:
         raise SystemExit("scp to remote_code_dir failed")
+    if config.get("replay_episode"):
+        episode = ROOT / config["replay_episode"]
+        if not episode.exists():
+            raise SystemExit(f"replay_episode {episode} does not exist; record it with episode_recorder.py")
+        upload = episode
+        if episode.is_dir():
+            # The server reads an .npz so its venv needs no pandas.
+            import tempfile
+
+            from simple_policy_server import write_replay_npz
+
+            upload = Path(tempfile.gettempdir()) / Path(remote_episode(config)).name
+            write_replay_npz(episode, upload)
+        if subprocess.call(["scp", str(upload), f"{scp_target(config)}:{remote_dir}/{remote_episode(config)}"]) != 0:
+            raise SystemExit("scp of replay_episode failed")
     python = config.get("remote_python") or "python3"
     run_ssh(
         config,
@@ -418,8 +478,10 @@ def show(config):
 def main():
     parser = argparse_parser()
     args = parser.parse_args()
-    config = load()
+    config = with_mode(load(), args.server)
     extra = []
+    if args.ready:
+        extra.append("--ready")
     if args.speed is not None:
         extra += ["--speed", str(args.speed)]
     if args.freq is not None:
@@ -451,6 +513,8 @@ def argparse_parser():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("run", "up", "once", "down", "arm", "job", "serve", "show", "setup-remote"))
+    parser.add_argument("--server", choices=SERVER_MODES, help="override server_mode in team_config.json for this command")
+    parser.add_argument("--ready", action="store_true", help="unfold to the ready pose before the first observation")
     parser.add_argument("--speed", type=int, help="joint speed percent, passed to policy_link.py once")
     parser.add_argument("--freq", type=float, help="joint target updates per second, passed to policy_link.py once")
     return parser

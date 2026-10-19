@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 权威文档：`DEVELOPER_GUIDE.md`（协议、契约、设备问题）和 `USER_GUIDE.md`（操作步骤）。中文版 `开发文档.md` / `用户文档.md` 是同内容的翻译——**改动文档时要同时更新中英文两份**。
 
-没有测试套件、没有构建步骤、没有依赖清单文件。运行时依赖：`numpy`、`msgpack`、`websockets>=13`、`opencv-python`（`cv2`）；macOS 还需要 `pyusb`、`pyobjc-framework-AVFoundation` 和 `brew install libusb`。macOS 上按 USB ID 自动找 Astra Pro（复现 OpenCV 的 uniqueID 排序），`camera_index` 非空时覆盖；运行命令的 App 需要相机权限。Mac 上用仓库内的 `.venv`（`.venv/bin/python`）。
+没有测试套件、没有构建步骤、没有依赖清单文件。运行时依赖：`numpy`、`msgpack`、`websockets>=13`、`opencv-python`（`cv2`），录制/导出还要 `pandas`、`pyarrow`；macOS 还需要 `pyusb`、`pyobjc-framework-AVFoundation` 和 `brew install libusb`。macOS 上按 USB ID 自动找 Astra Pro（复现 OpenCV 的 uniqueID 排序），`camera_index` 非空时覆盖；运行命令的 App 需要相机权限。Mac 上用仓库内的 `.venv`（`.venv/bin/python`）。
 
 当前目标路线（第一步已实现，未上实机）：Mac 直连机械臂 → athena（`ssh athena`，Duke 集群，可能需要 VPN）上跑策略服务器 → 之后采集真实数据、训练模型完成 memory 任务。
 
@@ -22,7 +22,13 @@ python team_config.py once      # 服务器和转发仍在时再跑一轮连续�
 python team_config.py down      # 取消 serve-policy 任务并关闭本地 ssh -N
 python team_config.py job|serve # 仅打印手动启动服务器的命令
 python team_config.py setup-remote  # server_mode=simple：把测试服务器拷到 remote_code_dir 并建 venv
-python simple_policy_server.py --port 8000  # 脚本化测试策略：+X 往返 10 mm、夹爪交替
+python simple_policy_server.py --port 8000 [--mode demo|nudge|replay --episode F]  # 脚本化测试策略，默认关节 demo
+python episode_recorder.py --task "..."  # 拖动示教只读录制（相机+反馈），s/f/d 结束；Win/Mac 通用
+python episode_check.py episodes/episode_...   # 时间线和曲线检查
+python dataset_export.py episodes/episode_...  # 成功的 episode 导出 0.05 s 网格的 12 维动作和 mask；--self-check 不连臂
+python team_config.py run --server replay|openpi [--ready]  # 覆盖 server_mode；--ready 先展开到 READY_DEG
+python policy_link.py ready     # 只把臂展开到准备姿态（会动臂）
+python policy_link.py home      # 收回到休息位，全关节 0（会动臂）
 python policy_link.py cameras   # 列出相机编号和名字
 python policy_link.py preview [--index N]  # 实时预览，左上角是 224×224 模型输入，q 退出
 python policy_link.py serve     # 本地占位服务器 127.0.0.1:8765，只检查 observation 形状、返回占位动作
@@ -43,7 +49,9 @@ python check_candidate_repo.py PATH_TO_REPO   # 换模型前检查候选策略�
 - `piper_client.py` 的传输层按平台选择：Windows 是 `_WinUsbTransport`（ctypes 调 WinUSB，读写用独立 OVERLAPPED 事件），其它平台是 `_LibUsbTransport`（pyusb）。两者只提供 `open/close/control/read/write`；libusb 版用后台线程持续排空 IN 端点到 256 帧队列（否则约十几帧后写入 errno 60 超时，不要去掉）；`open_transport()` 统一发 gs_usb 控制传输启动 48 MHz / 1 Mbps 总线，帧解析与回显排空在 `PiperClient` 里共用。每次写后都要排空发送回显（`echo_id == 0`），否则后续写会卡住。关闭时**不发**总线停止控制传输（会挂起进程）。
 - `team_config.py` 的 `server_mode`：`simple` 在 `remote_code_dir` 跑 `simple_policy_server.py`、不申请 GPU；`openpi` 在 `openpi_dir` 跑 `scripts/serve_policy.py`。远端路径可以写 `~/`，由 `remote_quote()` 展开。非 Windows 上隧道是后台 `ssh -f -N -L`，`down` 用 `pkill` 关闭。
 - 从折叠休息位姿发末端位姿目标会被机械臂逆解拒绝（`TARGET_EXCEEDS_LIMIT`，只有夹爪动）。服务器回复可带 `"action_space": "joints"`，动作为 `(N, 7)` 绝对关节角加夹爪，由 `apply_joint_actions()` 用 MOVE J（`0x155`–`0x157`）执行；每步内部按 `--freq`（默认 100 Hz）插值更新目标（只按 20 Hz 换目标会让 J1/J2 一卡一卡），速度取 `--speed` 或 `joint_speed`；`check_joint_chunk()` 限制每步不超过 3 度。`simple_policy_server.py` 默认 `--mode demo` 就走这条路。
-- `policy_step.check_limits()` 在发送任何帧前检查 `max_chunk_shift_mm`（离 chunk 起点的最大距离）和 `workspace_mm`（基座系绝对盒子），超限就 raise。不要绕过它。
+- `server_mode` 有 `simple`/`replay`/`openpi` 三种，`--server` 临时覆盖，`mode_overrides[mode]` 覆盖 Slurm 等键。任务带 `--comment=MODE`，换模式前要 `down`。本仓库 16 维 state / `(50, 12)` 动作契约来自 RoboCasa pi0.5（openpi 配置 `pi05_pretrain_human300`）；`openpi_python` 可指向装好它的 conda 环境。回放服务器回复 `"done": True` 时客户端正常退出。
+- 训练数据：`episode_recorder.py` 只读录制（相机 `open_policy_camera()` + `read_state()`，`KeyReader` 跨平台读键），格式和导出规则见 `数据采集.md`。回放服务器直接读这种 episode 文件夹（`episode_arrays()`），`setup-remote` 转成 `.npz` 上传。
+- `policy_step.check_limits()` 在发送任何帧前检查 `max_chunk_shift_mm`（离 chunk 起点的最大距离）和 `workspace_mm`（基座系绝对盒子），超限抛 `ChunkRefused`（apply 退出码 3），`policy_link.py` 打印 `chunk_refused` 跳过这个 chunk 继续观测。不要绕过它。`execute_steps`/`ee_delta_scale` 只执行 chunk 前 N 步并缩放（仿真模型的整段 chunk 积分是米级）。
 
 ## 模型相关的契约（换模型时首先要改的地方）
 
