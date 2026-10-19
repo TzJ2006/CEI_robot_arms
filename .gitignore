@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+_camera_test/
+_can_listen_log.txt
+piper_link_state.json
