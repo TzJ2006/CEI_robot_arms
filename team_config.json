@@ -1,0 +1,15 @@
+{
+  "ssh_host": "",
+  "login_host": "",
+  "remote_user": "",
+  "local_forward_port": 8000,
+  "log_dir": "",
+  "openpi_dir": "",
+  "policy_config": "",
+  "checkpoint_dir": "",
+  "slurm_partition": "",
+  "slurm_time": "",
+  "slurm_gpus": 1,
+  "slurm_cpus": 8,
+  "slurm_mem": ""
+}
