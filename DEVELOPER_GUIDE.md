@@ -4,13 +4,13 @@ This guide is for people changing the code or checking the protocol. Operating s
 
 ```mermaid
 flowchart TB
-  subgraph win [Windows]
+  subgraph pc [Windows or macOS]
     client[policy_link.py once]
     armclient[piper_client.py]
     client --> armclient
   end
   subgraph bus [CAN 1 Mbps]
-    adapter[candleLight WinUSB]
+    adapter[candleLight gs_usb]
   end
   subgraph cluster [Login node and compute node]
     tunnel[Login node ssh -L]
@@ -40,7 +40,7 @@ flowchart TB
 
 | File | Role |
 | --- | --- |
-| `piper_client.py` | Opens candleLight through WinUSB, reads `0x2A1`–`0x2A8`, and sends gripper `0x159`, leave-teach `0x150`, enable `0x471`, MOVE P `0x151`, and end pose `0x152`–`0x154` |
+| `piper_client.py` | Opens candleLight (WinUSB on Windows, libusb on macOS), reads `0x2A1`–`0x2A8`, and sends gripper `0x159`, leave-teach `0x150`, enable `0x471`, MOVE P `0x151`, and end pose `0x152`–`0x154` |
 | `policy_link.py` | Builds the observation, keeps one WebSocket open, and loops inference. The camera and CAN writes are not in the same process |
 | `policy_step.py` | Integrates one action chunk into an end-effector trajectory in the base frame and writes it to CAN. It does not import `piper_sdk` at runtime |
 | `team_config.json` | Login account, SSH alias, checkpoint, and log directory. This is the only file to edit when the environment changes |
@@ -53,13 +53,13 @@ flowchart TB
 
 Paths are relative to the directory that contains this code. Do not put someone's desktop absolute path into the docs or into new code. Server paths come from `team_config.json`.
 
-`piper_sdk` and `piper_ros` are in the repository, but both use Linux `can0`. The Windows control loop does not call them. CAN IDs and byte order were checked against the SDK; `piper_client.py` still sends the frames.
+`piper_sdk` and `piper_ros` are in the repository, but both use Linux `can0`. The control loop on Windows and macOS does not call them. CAN IDs and byte order were checked against the SDK; `piper_client.py` still sends the frames.
 
 Running `python piper_client.py` queries the gripper limit and then performs one full open and close. The library call `read_state()` sends no motion command.
 
 ## piper_client.py
 
-`PiperClient` is a context manager. On connect it opens WinUSB with overlapped I/O, sets the adapter to 1 Mbps for a 48 MHz clock, and starts the controller.
+`PiperClient` is a context manager. On Windows, connect opens WinUSB with overlapped I/O. On macOS it uses libusb. Both set the adapter to 1 Mbps for a 48 MHz clock and start the controller.
 
 `read_state(timeout=0.6)` sets `complete` to True only after all eight IDs below have arrived:
 
@@ -90,7 +90,7 @@ Reads and writes use separate events. Each write waits for completion and drains
 
 `policy_link.py` uses the same WebSocket as `openpi_client`: after connect, the server sends one msgpack metadata message; each later observation is one msgpack message, and each reply is one msgpack message. NumPy arrays travel in an `__ndarray__` map whose keys are the bytes `data`, `dtype`, and `shape`.
 
-Server directory, account, host name, and model name live only in each person's `team_config.json`. If a field is missing, `team_config.py` names the keys to fill and does not reuse someone else's paths. Operators run `python team_config.py run`. It submits or reuses a job named `serve-policy` on the login node, waits until the log contains `listening on`, reads `NodeAddr` from `scontrol`, opens one Windows `ssh -L` to that address, then calls `policy_link.py once`. `down` cancels that user's `serve-policy` jobs and stops the matching local `ssh -N`. `job` and `serve` still only print text for someone who needs to start the server by hand.
+Server directory, account, host name, and model name live only in each person's `team_config.json`. If a field is missing, `team_config.py` names the keys to fill and does not reuse someone else's paths. Operators run `python team_config.py run`. It submits or reuses a job named `serve-policy` on the login node, waits until the log contains `listening on`, reads `NodeAddr` from `scontrol`, opens one local `ssh -L` to that address, then calls `policy_link.py once`. On Windows the forward stays in its own window. On macOS it runs in the background, and `down` stops it with `pkill`. `down` cancels that user's `serve-policy` jobs and stops the matching local `ssh -N`. `job` and `serve` still only print text for someone who needs to start the server by hand.
 
 Order inside `once`:
 
@@ -143,11 +143,11 @@ Do not change the msgpack packing. With only one Astra Pro, say that all three f
 | 7–10 | base and torso | This Piper has no such mechanisms, so these values are dropped |
 | 11 | control mode | Not a length; dropped |
 
-Every returned step becomes a waypoint and is sent at 0.05 s with speed 50%. A chunk is no longer cut off at 10 mm or 5 degrees. After the chunk, `policy_link.py` requests the next one with a new image and state. Verified: after leaving teach mode, the arm followed one chunk's final pose, with `motion=0`.
+`execute_steps` in `team_config.json` keeps only the first N steps of each chunk (empty means all of them). `ee_delta_scale` scales translation and rotation (empty means 1). Before any frame is sent, `check_limits()` refuses a chunk that reaches farther than `max_chunk_shift_mm` from the start pose. Each kept step is sent at 0.05 s with speed 50%. After the chunk, `policy_link.py` requests the next one with a new image and state. Verified: after leaving teach mode, the arm followed one chunk's final pose, with `motion=0`.
 
 ## macOS and the simple server
 
-Not yet verified on hardware. `piper_client.py` chooses the transport by platform: `_WinUsbTransport` on Windows and `_LibUsbTransport` (pyusb, VID `1D50` / PID `606F`) elsewhere. `open_transport()` sends the same gs_usb control transfers for both, and the 20-byte frames, echo draining, and every CAN ID are shared. `_can_listen.py` uses the libusb transport off Windows.
+Windows and macOS are both supported. `piper_client.py` chooses the transport by platform: `_WinUsbTransport` on Windows and `_LibUsbTransport` (pyusb, VID `1D50` / PID `606F`) on macOS. `open_transport()` sends the same gs_usb control transfers for both, and the 20-byte frames, echo draining, and every CAN ID are shared. `_can_listen.py` uses the libusb transport on macOS.
 
 The libusb transport drains the IN endpoint from a background thread into a 256-frame queue (about 0.1 s of feedback; the oldest frame is dropped when full). Without that, feedback at about 2,700 frames/s exhausts the adapter's frame buffers and OUT writes time out with errno 60 after about a dozen frames. Do not go back to reading only between writes.
 
@@ -188,7 +188,7 @@ Replay uses the drag-teach episodes from `episode_recorder.py` (see `数据采�
 `policy_link.py home` uses the same `go_to()` path to fold to `HOME_DEG` (all zeros, the rest pose). `policy_link.py ready` and `once --ready` unfold to `READY_DEG` with joint targets before an `ee_delta` model, since end-pose targets from the folded pose are rejected.
 
 
-The adapter is a candleLight, `VID_1D50` / `PID_606F`, WinUSB, interface GUID `{c15b4308-04d3-11e6-b3ea-6057189e6443}`, CAN clock 48 MHz.
+The adapter is a candleLight, `VID_1D50` / `PID_606F`, CAN clock 48 MHz. On Windows it is WinUSB, interface GUID `{c15b4308-04d3-11e6-b3ea-6057189e6443}`. On macOS, libusb opens the same VID/PID.
 
 These make `CreateFile` return error 5:
 
