@@ -20,6 +20,7 @@ from policy_link import open_policy_camera
 
 SCHEMA_VERSION = 1
 CAMERA_ID = "vid_2bc5_pid_0501"
+PREVIEW_WINDOW = "piper record"
 
 
 class KeyReader:
@@ -93,10 +94,27 @@ def _write_metadata(path, payload):
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def _preview(frame):
+    """Show the frame being saved. Return s, f, or d if that key is pressed in the window."""
+    try:
+        if cv2.getWindowProperty(PREVIEW_WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+            return None
+        if frame is not None:
+            cv2.imshow(PREVIEW_WINDOW, frame)
+        pressed = cv2.waitKey(1) & 0xFF
+    except cv2.error:
+        return None
+    if pressed in (ord("s"), ord("f"), ord("d")):
+        return chr(pressed)
+    return None
+
+
 def record_episode(task, out_dir, seconds=None):
-    print("keys: s success, f failure, d discard. Drag the arm; this program only reads.", flush=True)
+    print("A window shows the camera. keys: s success, f failure, d discard. Drag the arm; this program only reads.", flush=True)
+    cv2.namedWindow(PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
     capture, camera_index = open_policy_camera()
     if not capture.isOpened():
+        cv2.destroyWindow(PREVIEW_WINDOW)
         raise RuntimeError(f"could not open the Astra Pro color camera at index {camera_index}")
     capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -106,6 +124,7 @@ def record_episode(task, out_dir, seconds=None):
         robot.connect()
     except Exception:
         capture.release()
+        cv2.destroyWindow(PREVIEW_WINDOW)
         raise
 
     episode_id = time.strftime("episode_%Y%m%d_%H%M%S")
@@ -162,6 +181,8 @@ def record_episode(task, out_dir, seconds=None):
                         metadata["image_write_failures"] += 1
                 else:
                     metadata["camera_read_failures"] += 1
+                    frame = None
+                preview_key = _preview(frame if ok else None)
                 state = robot.read_state(timeout=0.05)
                 t_robot = _clock(origin)
                 if state["complete"]:
@@ -171,7 +192,7 @@ def record_episode(task, out_dir, seconds=None):
                 if seconds is not None and _clock(origin) >= seconds:
                     reason = "smoke"
                     break
-                key = keys.key()
+                key = keys.key() or preview_key
                 if key is not None:
                     if key == "s":
                         reason, success = "success", True
@@ -190,6 +211,10 @@ def record_episode(task, out_dir, seconds=None):
         finally:
             capture.release()
             robot.close()
+            try:
+                cv2.destroyWindow(PREVIEW_WINDOW)
+            except cv2.error:
+                pass
 
     metadata["success"] = success
     metadata["termination_reason"] = reason

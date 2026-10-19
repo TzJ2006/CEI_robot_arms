@@ -2,21 +2,21 @@
 
 This guide is for people operating the arm. To change code, observation fields, or the CAN protocol, read `DEVELOPER_GUIDE.md`. The Chinese version is `用户文档.md`.
 
-What this does: the Windows computer reads the arm, captures one Orbbec Astra Pro color frame, copies that same frame into the three image fields, and sends the observation through the local SSH tunnel. Each reply is a 50-step end-effector chunk. The computer plays the whole chunk in the arm base frame, then reads a new state and image and requests the next chunk, until you press `Ctrl+C`. Account, code directory, server name, and model name belong in `team_config.json`. This guide does not hard-code them.
+What this does: a Windows or Mac computer reads the arm, captures one Orbbec Astra Pro color frame, copies that same frame into the three image fields, and sends the observation through the local SSH tunnel. Each reply is an end-effector chunk. The computer plays it in the arm base frame, then reads a new state and image and requests the next chunk, until you press `Ctrl+C`. Account, code directory, server name, and model name belong in `team_config.json`. This guide does not hard-code them. On a Mac, use `.venv/bin/python` wherever this guide says `python`.
 
 ```mermaid
 flowchart LR
   arm[Piper]
   cam[Orbbec Astra Pro]
-  win[Windows computer]
+  pc[Windows or Mac]
   login[Login node]
   gpu[Model on a compute node]
-  arm -->|CAN| win
-  cam -->|same frame| win
-  win -->|SSH tunnel| login
+  arm -->|CAN| pc
+  cam -->|same frame| pc
+  pc -->|SSH tunnel| login
   login -->|SSH tunnel| gpu
-  gpu -->|50-step end-effector chunk| win
-  win -->|pose and gripper| arm
+  gpu -->|end-effector chunk| pc
+  pc -->|pose and gripper| arm
 ```
 
 ## Find a task
@@ -34,9 +34,9 @@ flowchart LR
 
 ## Before you start
 
-- Close ArmRobot. While it is open, this computer cannot open the CAN adapter.
+- On Windows, close ArmRobot first. While it is open, this computer cannot open the CAN adapter.
 - Power the arm and plug the CAN cable into the arm's CAN port.
-- Run every Windows command in this folder. This folder is wherever you unpacked the code, not someone else's desktop path.
+- Run every command in this folder. This folder is wherever you unpacked the code, not someone else's desktop path. On Windows use `python`. On a Mac use `.venv/bin/python`.
 - Put the server account, checkpoint, and SSH alias in `team_config.json` in this same folder. When the machine or account changes, edit that file and generate the commands with `python team_config.py`.
 - `ssh_host` may stay empty. The program then connects with `login_host` and `remote_user`. If you already have a Host in `.ssh\config`, put that Host name in `ssh_host`.
 
@@ -79,7 +79,7 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 
 - Do not run `python piper_client.py`. That command opens the gripper fully and then closes it.
 - Do not run `run` or `once` while drag-teach is still on. While status stays `TEACHING` with `teach=1`, end-effector commands are ignored. Leave teach mode first so status can enter `CAN_CTRL`.
-- Leave room around the arm. Each chunk is all 50 steps returned by the model, and the travel can be more than 1 cm.
+- Leave room around the arm. `execute_steps` and `ee_delta_scale` shorten and shrink the chunk first. A chunk farther than `max_chunk_shift_mm` from its start is refused before anything is sent.
 - The language instruction is the `prompt` field in `policy_link.py`. Change that English sentence before a run. There is no separate command-line prompt.
 - Do not install a fresh environment on the compute node. Use the Python already installed under `openpi_dir`.
 - Do not copy a job script or an SSH forward from this guide onto the login node. `run`, `once`, and `down` connect by themselves.
@@ -128,10 +128,10 @@ python team_config.py run
 1. Connect to the login node. When it asks for a password, type it in this window. The characters are not shown.
 2. Submit a job named `serve-policy` when you do not already have one, and reuse it when you do. `--port` is placed before `policy:checkpoint`.
 3. Check the job about every 10 seconds. After the log says the server is listening, read the compute-node address. Warnings from a simulator while the model loads can be ignored for now. Do not SSH into the compute node; SSH can hang while the node is busy.
-4. Open a window titled `piper-link` for the local forward. Type the SSH password once more in that window, then leave it open.
-5. Read the arm and the Astra Pro, send an observation, execute the whole returned chunk, then start the next chunk. The port is `local_forward_port`. The arm moves. Press `Ctrl+C` to stop the loop.
+4. Open the local forward. On Windows this is a window titled `piper-link`: type the SSH password once more there, then leave it open. On a Mac the forward runs in the background and there is no window.
+5. Read the arm and the Astra Pro, send an observation, execute the chunk after `execute_steps` and `ee_delta_scale`, then start the next chunk. The port is `local_forward_port`. The arm moves. Press `Ctrl+C` to stop the loop.
 
-While the server and the forward window are still up, start another continuous run without submitting again:
+While the server and the forward are still up, start another continuous run without submitting again:
 
 ```powershell
 python team_config.py once
@@ -169,7 +169,7 @@ A chunk that reached its target shows `CAN_CTRL` and `motion=0`. The pose under 
 | `complete=True` | Joints, gripper, pose, and status were all received |
 | `image_mean` | Average brightness of the Orbbec Astra Pro color frame after padding to 224×224. Only one camera is connected, so that same frame fills the external, wrist, and right image fields |
 | `cycle` | Which chunk this is. Each chunk captures a new frame and requests a new inference |
-| `command_steps` | How many steps of this chunk were sent. The current code sends every step the model returned |
+| `command_steps` | How many steps of this chunk were sent. With `execute_steps` empty, every step the model returned is sent |
 | `shift_mm` | Total end-effector translation of this chunk, in millimeters |
 | `target_mm_deg` | Target pose of the last step in this chunk |
 | `pose_sent` | The pose commands for this chunk have been written |
@@ -179,7 +179,7 @@ The current mapping reads the model output in the arm base frame: the first thre
 
 ## Stop this test
 
-`run` and `once` keep looping. Press `Ctrl+C` in that window. After `stopped` appears, the prompt returns. The policy server and the `piper-link` forward window stay up, and the compute node keeps the GPU.
+`run` and `once` keep looping. Press `Ctrl+C` in that window. After `stopped` appears, the prompt returns. The policy server and the local forward stay up, and the compute node keeps the GPU. On Windows the forward window is titled `piper-link`.
 
 To stop the server and release the GPU:
 
@@ -207,8 +207,8 @@ Confirm that `python team_config.py down` has finished, then follow this order:
 | What you see | What it means | What to do |
 | --- | --- | --- |
 | Fill these keys in team_config.json | Some config fields are still empty | Fill the listed keys, then run `python team_config.py show` |
-| A direct connection from Windows to the server port times out | The login node often does not expose the policy port | Run `python team_config.py run`. It forwards to the compute-node address |
-| The `piper-link` window sits there with no prompt | The forward is up | Leave that window open and return to the first one |
+| A direct connection from this computer to the server port times out | The login node often does not expose the policy port | Run `python team_config.py run`. It forwards to the compute-node address |
+| On Windows, the `piper-link` window sits there with no prompt | The forward is up | Leave that window open and return to the first one. On a Mac the forward is in the background and there is no window |
 | Enter after the password only moves to the next line | The forward window does not open a shell | Press Enter once for the password |
 | `channel ... Connection timed out` | The forward is aimed at a compute node that is no longer listening | Run `python team_config.py down`, then `python team_config.py up` |
 | The log says `--port` is unrecognized | An older launch script was used | Run `python team_config.py run` again |
@@ -216,6 +216,6 @@ Confirm that `python team_config.py down` has finished, then follow this order:
 | The server reports a missing `observation` field | The observation does not match this model | Change `build_observation()` as described in the developer guide, and do not execute the actions |
 | `timed out in 5.0s` | An older client did not wait long enough for the model | Use the current program; it prints `waiting_for_inference` first |
 | The log shows the job already exited | The server is not still on the compute node | Read the log tail printed by `run`, fix the config, and run `run` again |
-| CAN cannot be opened, error 5 | ArmRobot, VMware, or a Python process from an earlier run owns the adapter | Close ArmRobot. If it still fails, unplug and replug the candleLight, then see device ownership in the developer guide |
+| On Windows, CAN cannot be opened, error 5 | ArmRobot, VMware, or a Python process from an earlier run owns the adapter | Close ArmRobot. If it still fails, unplug and replug the candleLight, then see device ownership in the developer guide |
 | Status stays `TEACHING` and the pose does not change | Drag-teach is on, so pose commands are ignored | Leave teach mode, then run `once` |
-| Exit code `3221225477` | An access violation occurred when the camera and CAN writes shared one process | Use the current program. Motion is sent from a separate process |
+| On Windows, exit code `3221225477` | An access violation occurred when the camera and CAN writes shared one process | Use the current program. Motion is sent from a separate process |

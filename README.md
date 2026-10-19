@@ -1,8 +1,8 @@
 # CEI robot arms
 
-Windows computer reads an AgileX Piper and one Orbbec Astra Pro color camera, sends the observation to a policy server over an SSH tunnel, and executes each returned end-effector chunk until you press `Ctrl+C`. Server account, host, and checkpoint live in `team_config.json`. This repository does not hard-code them.
+A Windows or Mac computer reads an AgileX Piper and one Orbbec Astra Pro color camera, sends the observation to a policy server over an SSH tunnel, and executes each returned end-effector chunk until you press `Ctrl+C`. Server account, host, and checkpoint live in `team_config.json`. This repository does not hard-code them.
 
-本机是一台 Windows 电脑。它经 candleLight 读取 AgileX Piper，用 Orbbec Astra Pro 拍一张彩色图，把同一帧填进三个图像字段，经 SSH 隧道发给计算节点上的策略服务。服务每次返回 50 步末端增量。本机按底座坐标执行整段，然后重新观测，直到按 `Ctrl+C`。
+本机可以是 Windows 或 Mac。它经 candleLight 读取 AgileX Piper，用 Orbbec Astra Pro 拍一张彩色图，把同一帧填进三个图像字段，经 SSH 隧道发给计算节点上的策略服务。服务每次返回一段末端增量。本机按底座坐标执行，然后重新观测，直到按 `Ctrl+C`。Mac 上用仓库里的 `.venv/bin/python`，并先按开发文档安装 libusb。
 
 操作步骤看 [`用户文档.md`](用户文档.md)，英文版是 [`USER_GUIDE.md`](USER_GUIDE.md)。改观测、动作映射或 CAN 协议时看 [`开发文档.md`](开发文档.md)，英文版是 [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md)。训练数据采集的规定看 [`数据采集.md`](数据采集.md)。
 
@@ -10,48 +10,50 @@ Windows computer reads an AgileX Piper and one Orbbec Astra Pro color camera, se
 flowchart LR
   arm[Piper]
   cam[Astra Pro]
-  win[Windows]
+  pc[Windows or Mac]
   gpu[Policy server]
-  arm -->|CAN| win
-  cam -->|one frame| win
-  win -->|SSH tunnel| gpu
-  gpu -->|50-step chunk| win
-  win -->|pose and gripper| arm
+  arm -->|CAN| pc
+  cam -->|one frame| pc
+  pc -->|SSH tunnel| gpu
+  gpu -->|end-effector chunk| pc
+  pc -->|pose and gripper| arm
 ```
 
 ## Start
 
-Fill `team_config.json`, then run these commands in this folder:
+Fill `team_config.json`, then run these commands in this folder. On a Mac, use `.venv/bin/python` instead of `python`.
 
 ```powershell
 python team_config.py show
 python team_config.py run
 ```
 
-`run` submits or reuses the `serve-policy` job, opens the local forward, and starts the control loop. The arm moves. Press `Ctrl+C` and wait for `stopped`. While the server and the forward window are still up:
+`run` submits or reuses the `serve-policy` job, opens the local forward, and starts the control loop. The arm moves. Press `Ctrl+C` and wait for `stopped`. While the server and the forward are still up:
 
 ```powershell
 python team_config.py once
 ```
 
-Stop the job and the forward with `python team_config.py down`. Check the arm without moving it with `python team_config.py arm`. Save one camera frame with `python _realsense_test.py`; the picture is `_camera_test\astra_color.png`.
+Stop the job and the forward with `python team_config.py down`. Check the arm without moving it with `python team_config.py arm`. Preview the camera with `python policy_link.py preview` (press q to close).
 
-Close ArmRobot before any of these commands. Leave drag-teach before `run` or `once`. While status stays `TEACHING` with `teach=1`, pose commands are ignored. Edit the `prompt` string in `policy_link.py` before a run. Do not run `python piper_client.py`; that command opens and closes the gripper.
+On Windows, close ArmRobot before any of these commands. Leave drag-teach before `run` or `once`. While status stays `TEACHING` with `teach=1`, pose commands are ignored. Edit the `prompt` string in `policy_link.py` before a run. Do not run `python piper_client.py`; that command opens and closes the gripper.
 
-Python packages used here are `numpy`, `opencv-python`, `msgpack`, and `websockets`. The CAN client uses the Windows WinUSB API and does not import `piper_sdk`.
+To record a drag-teach episode, turn drag-teach on first, then run `python collect.py --task "put the pen in the box"`. A window shows the camera. Press `s` when the attempt succeeds. See `用户文档.md`.
+
+Python packages used here are `numpy`, `opencv-python`, `msgpack`, and `websockets`. Recording also needs `pandas` and `pyarrow`. Mac also needs `pyusb`, `pyobjc-framework-AVFoundation`, and `brew install libusb`. The CAN client does not import `piper_sdk`: Windows uses WinUSB, and Mac uses libusb.
 
 ## Files
 
 | File | Role |
 | --- | --- |
 | `team_config.json` | Login account, SSH host, checkpoint, and Slurm settings. Edit this when the environment changes |
-| `team_config.py` | `run`, `once`, `down`, and `arm` |
-| `policy_link.py` | Observation, WebSocket loop, and Astra Pro capture (`VID_2BC5` `PID_0501`) |
+| `team_config.py` | `run`, `once`, `down`, `arm`, and `setup-remote`. `--server` selects `simple`, `replay`, or `openpi` |
+| `policy_link.py` | Observation, WebSocket loop, Astra Pro capture (`VID_2BC5` `PID_0501`), plus `preview`, `cameras`, `ready`, and `home` |
+| `simple_policy_server.py` | Scripted server for a link test, joint demo, or episode replay |
 | `policy_step.py` | Turns one 12-d chunk into base-frame pose commands |
-| `piper_client.py` | candleLight WinUSB client |
+| `piper_client.py` | candleLight client: WinUSB on Windows, libusb on Mac |
 | `check_candidate_repo.py` | Search a candidate policy repo before changing the action mapping |
 | `_can_listen.py` | Receive-only CAN capture |
-| `_realsense_test.py` | Save one Astra Pro color frame |
 | `collect.py` | One command for a training episode: record, check, and export after `s`. `--latest` does the last two for the newest episode |
 | `episode_recorder.py` | Read-only drag-teach episode: arm feedback, one Astra frame, start and success or failure |
 | `episode_check.py` | Print the episode timeline and save pose curves beside frames |

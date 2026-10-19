@@ -10,7 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 没有测试套件、没有构建步骤、没有依赖清单文件。运行时依赖：`numpy`、`msgpack`、`websockets>=13`、`opencv-python`（`cv2`），录制/导出还要 `pandas`、`pyarrow`；macOS 还需要 `pyusb`、`pyobjc-framework-AVFoundation` 和 `brew install libusb`。macOS 上按 USB ID 自动找 Astra Pro（复现 OpenCV 的 uniqueID 排序），`camera_index` 非空时覆盖；运行命令的 App 需要相机权限。Mac 上用仓库内的 `.venv`（`.venv/bin/python`）。
 
-当前目标路线（第一步已实现，未上实机）：Mac 直连机械臂 → athena（`ssh athena`，Duke 集群，可能需要 VPN）上跑策略服务器 → 之后采集真实数据、训练模型完成 memory 任务。
+本机可以是 Windows 或 macOS，直连机械臂，经 SSH 隧道连集群上的策略服务器。采集用 `collect.py`。Mac 上命令用 `.venv/bin/python`。
 
 ## 常用命令（在本目录下运行；Mac 上把 `python` 换成 `.venv/bin/python`）
 
