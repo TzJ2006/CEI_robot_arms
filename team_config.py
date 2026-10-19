@@ -11,6 +11,10 @@ is listening, opens one local SSH forward to that compute node, then sends
 one observation. `once` sends another observation while that forward is up.
 `down` cancels the serve-policy job and closes the local forward.
 
+server_mode "simple" runs simple_policy_server.py from remote_code_dir without
+a GPU; `setup-remote` copies it there and builds its venv. server_mode
+"openpi" runs scripts/serve_policy.py from openpi_dir.
+
 Account, code directory, and checkpoint stay in team_config.json.
 """
 
@@ -55,12 +59,44 @@ def configured_port(config=None):
     return int(value)
 
 
-def serve_command(config):
+SIMPLE_SERVER_FILES = ("simple_policy_server.py", "policy_link.py", "piper_client.py")
+
+
+def server_mode(config):
+    mode = config.get("server_mode") or "openpi"
+    if mode not in ("simple", "openpi"):
+        raise SystemExit(f'server_mode must be "simple" or "openpi", not {mode!r}')
+    return mode
+
+
+def remote_quote(path):
+    """Quote a remote path for bash while still expanding a leading ~/."""
+    path = str(path)
+    if path == "~":
+        return '"$HOME"'
+    if path.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
+def server_launch(config):
+    """Return (directory, command, needs_gpu) for the policy server on the compute node."""
+    port = int(config["local_forward_port"])
+    if server_mode(config) == "simple":
+        require(config, ["remote_code_dir", "local_forward_port"])
+        return config["remote_code_dir"], f".venv/bin/python simple_policy_server.py --port {port}", False
     require(config, ["openpi_dir", "policy_config", "checkpoint_dir", "local_forward_port"])
-    return f"""cd {config["openpi_dir"]}
-.venv/bin/python scripts/serve_policy.py --port {config["local_forward_port"]} policy:checkpoint \\
-  --policy.config={config["policy_config"]} \\
-  --policy.dir={config["checkpoint_dir"]}"""
+    command = (
+        f"{shlex.join(['.venv/bin/python', 'scripts/serve_policy.py', '--port', str(port), 'policy:checkpoint'])} "
+        f"--policy.config={shlex.quote(str(config['policy_config']))} "
+        f"--policy.dir={shlex.quote(str(config['checkpoint_dir']))}"
+    )
+    return config["openpi_dir"], command, True
+
+
+def serve_command(config):
+    directory, command, _needs_gpu = server_launch(config)
+    return f"cd {remote_quote(directory)}\n{command}"
 
 
 def job_script(config):
@@ -69,16 +105,17 @@ def job_script(config):
         ["log_dir", "slurm_partition", "slurm_time", "slurm_mem", "remote_user"],
     )
     cd_line, command = serve_command(config).split("\n", 1)
-    return f"""mkdir -p {config["log_dir"]}
-sbatch <<'EOF'
+    _directory, _command, needs_gpu = server_launch(config)
+    gres = f"#SBATCH --gres=gpu:{config['slurm_gpus']}\n" if needs_gpu else ""
+    return f"""mkdir -p {remote_quote(config["log_dir"])}
+sbatch <<EOF
 #!/bin/bash
 #SBATCH --job-name=serve-policy
 #SBATCH --partition={config["slurm_partition"]}
-#SBATCH --gres=gpu:{config["slurm_gpus"]}
-#SBATCH --cpus-per-task={config["slurm_cpus"]}
+{gres}#SBATCH --cpus-per-task={config["slurm_cpus"]}
 #SBATCH --mem={config["slurm_mem"]}
 #SBATCH --time={config["slurm_time"]}
-#SBATCH --output={config["log_dir"]}/serve-policy-%j.out
+#SBATCH --output={str(config["log_dir"]).replace("~", "$HOME", 1)}/serve-policy-%j.out
 {cd_line}
 exec {command}
 EOF"""
@@ -104,23 +141,20 @@ def remote_up_script(config):
         [
             "remote_user",
             "log_dir",
-            "openpi_dir",
-            "policy_config",
-            "checkpoint_dir",
             "local_forward_port",
             "slurm_partition",
             "slurm_time",
             "slurm_mem",
         ],
     )
+    directory, command, needs_gpu = server_launch(config)
+    gres = "#SBATCH --gres=gpu:$GPUS\n" if needs_gpu else ""
     port = int(config["local_forward_port"])
     return f"""set -eu
-LOG_DIR={shlex.quote(str(config["log_dir"]))}
+LOG_DIR={remote_quote(config["log_dir"])}
 PORT={port}
 ACCOUNT={shlex.quote(str(config["remote_user"]))}
-OPENPI={shlex.quote(str(config["openpi_dir"]))}
-POLICY={shlex.quote(str(config["policy_config"]))}
-CKPT={shlex.quote(str(config["checkpoint_dir"]))}
+SERVER_DIR={remote_quote(directory)}
 PARTITION={shlex.quote(str(config["slurm_partition"]))}
 SLURM_TIME={shlex.quote(str(config["slurm_time"]))}
 MEM={shlex.quote(str(config["slurm_mem"]))}
@@ -136,13 +170,12 @@ else
 #!/bin/bash
 #SBATCH --job-name=serve-policy
 #SBATCH --partition=$PARTITION
-#SBATCH --gres=gpu:$GPUS
-#SBATCH --cpus-per-task=$CPUS
+{gres}#SBATCH --cpus-per-task=$CPUS
 #SBATCH --mem=$MEM
 #SBATCH --time=$SLURM_TIME
 #SBATCH --output=$LOG_DIR/serve-policy-%j.out
-cd "$OPENPI"
-exec .venv/bin/python scripts/serve_policy.py --port "$PORT" policy:checkpoint --policy.config="$POLICY" --policy.dir="$CKPT"
+cd "$SERVER_DIR"
+exec {command}
 EOF
 )
   JOB_ID=${{JOB_ID%%;*}}
@@ -242,6 +275,13 @@ def open_tunnel(config, addr):
         print(f"Local port {port} is already forwarded; reusing it.", flush=True)
         return
     forward = f"{port}:{addr}:{port}"
+    if sys.platform != "win32":
+        print("Opening the local forward in the background. Type the SSH password here if asked.", flush=True)
+        argv = ssh_argv(config) + ["-f", "-N", "-o", "ExitOnForwardFailure=yes", "-L", forward]
+        if subprocess.call(argv) != 0 or not wait_for_local_port(port):
+            raise SystemExit(f"Local port {port} was not forwarded to {addr}")
+        print(f"Local port {port} is forwarded to {addr}.", flush=True)
+        return
     command = shell_join(ssh_argv(config) + ["-N", "-L", forward])
     print(
         "A window titled piper-link will open. Type the SSH password there once more, then leave that window open.",
@@ -279,13 +319,13 @@ def up(config):
     open_tunnel(config, ready["addr"])
 
 
-def once(config):
+def once(config, extra=()):
     port = configured_port(config)
     if not local_port_open(port):
         raise SystemExit(f"Local port {port} is not forwarded. Run python team_config.py up first")
     raise SystemExit(
         subprocess.call(
-            [sys.executable, str(ROOT / "policy_link.py"), "once", "--host", "127.0.0.1", "--port", str(port)]
+            [sys.executable, str(ROOT / "policy_link.py"), "once", "--host", "127.0.0.1", "--port", str(port), *extra]
         )
     )
 
@@ -302,6 +342,9 @@ def read_arm():
 
 
 def stop_local_tunnels(port):
+    if sys.platform != "win32":
+        subprocess.run(["pkill", "-f", f"ssh .*-N .*-L {port}:"], check=False)
+        return
     script = (
         "Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | "
         f"Where-Object {{ $_.CommandLine -like '*-N*' -and $_.CommandLine -like '*-L {port}:*' }} | "
@@ -332,9 +375,38 @@ echo "cancelled $ids"
         print("Cancelled the serve-policy job and closed the local forward.", flush=True)
 
 
-def run(config):
+def scp_target(config):
+    if config.get("ssh_host"):
+        return config["ssh_host"]
+    require(config, ["login_host", "remote_user"])
+    return f'{config["remote_user"]}@{config["login_host"]}'
+
+
+def setup_remote(config):
+    """Copy the simple server to remote_code_dir and build its venv on the login node."""
+    require(config, ["remote_code_dir"])
+    directory = config["remote_code_dir"]
+    run_ssh(config, f"set -eu\nmkdir -p {remote_quote(directory)}\n")
+    remote_dir = directory[2:] if directory.startswith("~/") else directory
+    files = [str(ROOT / name) for name in SIMPLE_SERVER_FILES]
+    if subprocess.call(["scp", *files, f"{scp_target(config)}:{remote_dir}/"]) != 0:
+        raise SystemExit("scp to remote_code_dir failed")
+    python = config.get("remote_python") or "python3"
+    run_ssh(
+        config,
+        f"""set -eu
+cd {remote_quote(directory)}
+if [ ! -x .venv/bin/python ]; then {shlex.quote(python)} -m venv .venv; fi
+.venv/bin/python -m pip install --quiet --upgrade pip
+.venv/bin/python -m pip install --quiet numpy msgpack 'websockets>=13'
+.venv/bin/python -c "import numpy, msgpack, websockets.sync.server; print('remote_ready', websockets.__version__)"
+""",
+    )
+
+
+def run(config, extra=()):
     up(config)
-    once(config)
+    once(config, extra)
 
 
 def show(config):
@@ -347,12 +419,17 @@ def main():
     parser = argparse_parser()
     args = parser.parse_args()
     config = load()
+    extra = []
+    if args.speed is not None:
+        extra += ["--speed", str(args.speed)]
+    if args.freq is not None:
+        extra += ["--freq", str(args.freq)]
     if args.mode == "run":
-        run(config)
+        run(config, extra)
     elif args.mode == "up":
         up(config)
     elif args.mode == "once":
-        once(config)
+        once(config, extra)
     elif args.mode == "down":
         down(config)
     elif args.mode == "arm":
@@ -363,6 +440,8 @@ def main():
         print(serve_command(config))
     elif args.mode == "show":
         show(config)
+    elif args.mode == "setup-remote":
+        setup_remote(config)
     else:
         raise SystemExit(f"unknown mode {args.mode}")
 
@@ -371,7 +450,9 @@ def argparse_parser():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("run", "up", "once", "down", "arm", "job", "serve", "show"))
+    parser.add_argument("mode", choices=("run", "up", "once", "down", "arm", "job", "serve", "show", "setup-remote"))
+    parser.add_argument("--speed", type=int, help="joint speed percent, passed to policy_link.py once")
+    parser.add_argument("--freq", type=float, help="joint target updates per second, passed to policy_link.py once")
     return parser
 
 

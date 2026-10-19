@@ -39,6 +39,24 @@ flowchart LR
 - Put the server account, checkpoint, and SSH alias in `team_config.json` in this same folder. When the machine or account changes, edit that file and generate the commands with `python team_config.py`.
 - `ssh_host` may stay empty. The program then connects with `login_host` and `remote_user`. If you already have a Host in `.ssh\config`, put that Host name in `ssh_host`.
 
+## On a Mac
+
+Run the one-time setup in the developer guide (`brew install libusb` and the `.venv`), then use `.venv/bin/python` in place of `python` below. Before the first run:
+
+1. Allow camera access for Terminal (System Settings > Privacy & Security > Camera). The Astra Pro is found automatically; `.venv/bin/python policy_link.py preview` shows what it sees live, and q closes the window. Only if it picks the wrong camera, put the right number from `policy_link.py cameras` in `camera_index`.
+2. With `server_mode` set to `"simple"`, `.venv/bin/python team_config.py setup-remote` copies the test server to athena once. Fill `slurm_partition` first.
+3. Leave room around the arm. The test server moves the end effector 10 mm along +X and back each chunk and opens or closes the gripper. A chunk farther than `max_chunk_shift_mm` from its start is refused before anything is sent.
+
+The local forward runs in the background instead of a `piper-link` window. `down` closes it.
+
+For joint-space chunks (the demo server), two flags tune smoothness and can be compared run to run; `team_config.py once` and `run` accept them too:
+
+```bash
+.venv/bin/python policy_link.py once --port 8000 --freq 100 --speed 60
+```
+
+`--freq` is how many times per second the joint target changes (default 100; 20 is the old stepwise behavior). `--speed` is the joint speed percent (default `joint_speed` in `team_config.json`). Each chunk prints the values it used.
+
 ## Do not
 
 - Do not run `python piper_client.py`. That command opens the gripper fully and then closes it.

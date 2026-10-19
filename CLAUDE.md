@@ -1,0 +1,63 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## 项目概述
+
+在 **Windows 或 macOS** 上驱动 AgileX Piper 机械臂，并把它接到集群上的 OpenPI 风格策略服务器：读取臂状态 + 一帧 Orbbec Astra Pro 彩色图像 → 通过 SSH 隧道经 WebSocket(msgpack) 发送 observation → 收到一个 action chunk（已验证为 `(50, 12)`）→ 整段执行 → 再观测、再推理，直到 `Ctrl+C`。
+
+权威文档：`DEVELOPER_GUIDE.md`（协议、契约、设备问题）和 `USER_GUIDE.md`（操作步骤）。中文版 `开发文档.md` / `用户文档.md` 是同内容的翻译——**改动文档时要同时更新中英文两份**。
+
+没有测试套件、没有构建步骤、没有依赖清单文件。运行时依赖：`numpy`、`msgpack`、`websockets>=13`、`opencv-python`（`cv2`）；macOS 还需要 `pyusb`、`pyobjc-framework-AVFoundation` 和 `brew install libusb`。macOS 上按 USB ID 自动找 Astra Pro（复现 OpenCV 的 uniqueID 排序），`camera_index` 非空时覆盖；运行命令的 App 需要相机权限。Mac 上用仓库内的 `.venv`（`.venv/bin/python`）。
+
+当前目标路线（第一步已实现，未上实机）：Mac 直连机械臂 → athena（`ssh athena`，Duke 集群，可能需要 VPN）上跑策略服务器 → 之后采集真实数据、训练模型完成 memory 任务。
+
+## 常用命令（在本目录下运行；Mac 上把 `python` 换成 `.venv/bin/python`）
+
+```powershell
+python team_config.py show      # 列出 team_config.json 里还没填的键
+python team_config.py arm       # 只读臂状态，不动臂（检查是否在线）
+python team_config.py run       # 提交/复用 slurm 任务 serve-policy，等 "listening on"，开 ssh -L，启动连续控制
+python team_config.py once      # 服务器和转发仍在时再跑一轮连续控制
+python team_config.py down      # 取消 serve-policy 任务并关闭本地 ssh -N
+python team_config.py job|serve # 仅打印手动启动服务器的命令
+python team_config.py setup-remote  # server_mode=simple：把测试服务器拷到 remote_code_dir 并建 venv
+python simple_policy_server.py --port 8000  # 脚本化测试策略：+X 往返 10 mm、夹爪交替
+python policy_link.py cameras   # 列出相机编号和名字
+python policy_link.py preview [--index N]  # 实时预览，左上角是 224×224 模型输入，q 退出
+python policy_link.py serve     # 本地占位服务器 127.0.0.1:8765，只检查 observation 形状、返回占位动作
+python policy_link.py once [--port N] [--freq HZ] [--speed PCT]  # 关节动作：目标每秒更新次数（默认 100，20=旧的一步一跳）和速度%
+python _can_listen.py           # 只收不发的 CAN 抓包，日志写到 _can_listen_log.txt
+python _realsense_test.py       # 存一帧 Astra Pro 彩色图到 _camera_test/
+python check_candidate_repo.py PATH_TO_REPO   # 换模型前检查候选策略仓库
+```
+
+**不要运行 `python piper_client.py`**：它会让夹爪完全张开再闭合（会动臂）。库调用 `read_state()` 不发运动命令。
+
+## 架构（跨文件才能看清的部分）
+
+- `team_config.py` 是编排层：通过 SSH 在登录节点提交/复用名为 `serve-policy` 的 slurm 任务，轮询日志直到出现 `listening on`，用 `scontrol` 取 `NodeAddr`，在单独窗口（标题 `piper-link`）开 `ssh -L` 指向计算节点，然后调用 `policy_link.py once`。所有服务器路径、账号、checkpoint 只来自 `team_config.json`；缺字段时报出要填的键，绝不复用别人的路径。
+- `policy_link.py` 持有整个循环的 WebSocket（与 `openpi_client` 线格式相同：先收一条 metadata，ndarray 用 `__ndarray__` + bytes 键 `data/dtype/shape` 编码）。每轮：`read_state()`（不完整则 raise 不发送）→ `capture_color()`（DirectShow 按 `VID_2BC5&PID_0501` 选相机，pad 到 224×224）→ `build_observation()` → 等推理（最长 600 s，字符串回复即服务端异常）→ 把动作交给**子进程** `policy_step.py apply <npy>` 执行。
+- **相机与 CAN 写入不能在同一进程**（会以 `3221225477` access violation 退出），且读状态用的 CAN client 必须在运动子进程启动前关闭，两者不能同时持有适配器。不要把这两部分合并回一个进程。
+- `policy_step.py` 的 `action_waypoints()` 把 12 维输出解释为基座系下末端增量：0–2 平移 ×0.05 m，3–5 轴角 ×0.5 rad 左乘，6 为夹爪（≥0.5 闭合到 0 mm，否则张开到 `gripper_max_mm()`），7–11 丢弃。每步按 0.05 s、速度 50% 发送 MOVE P 位姿。欧拉约定与 `piper_fk` 一致：`R = Rz·Ry·Rx`。
+- `piper_client.py` 的传输层按平台选择：Windows 是 `_WinUsbTransport`（ctypes 调 WinUSB，读写用独立 OVERLAPPED 事件），其它平台是 `_LibUsbTransport`（pyusb）。两者只提供 `open/close/control/read/write`；libusb 版用后台线程持续排空 IN 端点到 256 帧队列（否则约十几帧后写入 errno 60 超时，不要去掉）；`open_transport()` 统一发 gs_usb 控制传输启动 48 MHz / 1 Mbps 总线，帧解析与回显排空在 `PiperClient` 里共用。每次写后都要排空发送回显（`echo_id == 0`），否则后续写会卡住。关闭时**不发**总线停止控制传输（会挂起进程）。
+- `team_config.py` 的 `server_mode`：`simple` 在 `remote_code_dir` 跑 `simple_policy_server.py`、不申请 GPU；`openpi` 在 `openpi_dir` 跑 `scripts/serve_policy.py`。远端路径可以写 `~/`，由 `remote_quote()` 展开。非 Windows 上隧道是后台 `ssh -f -N -L`，`down` 用 `pkill` 关闭。
+- 从折叠休息位姿发末端位姿目标会被机械臂逆解拒绝（`TARGET_EXCEEDS_LIMIT`，只有夹爪动）。服务器回复可带 `"action_space": "joints"`，动作为 `(N, 7)` 绝对关节角加夹爪，由 `apply_joint_actions()` 用 MOVE J（`0x155`–`0x157`）执行；每步内部按 `--freq`（默认 100 Hz）插值更新目标（只按 20 Hz 换目标会让 J1/J2 一卡一卡），速度取 `--speed` 或 `joint_speed`；`check_joint_chunk()` 限制每步不超过 3 度。`simple_policy_server.py` 默认 `--mode demo` 就走这条路。
+- `policy_step.check_limits()` 在发送任何帧前检查 `max_chunk_shift_mm`（离 chunk 起点的最大距离）和 `workspace_mm`（基座系绝对盒子），超限就 raise。不要绕过它。
+
+## 模型相关的契约（换模型时首先要改的地方）
+
+observation 和 action 的含义随加载的 checkpoint 变化，不是本仓库的固定标准：
+- 输入：`build_observation()` 与 `robocasa_state()`（16 维 state 的顺序硬编码；三个图像字段目前是同一帧的拷贝）。`prompt` 字符串写在 `policy_link.py` 源码里，运行前按任务修改。
+- 输出：`policy_step.py` 的 `action_waypoints()`。`simple_policy_server.py` 生成的动作也依赖这个含义。
+- 换模型前先跑 `check_candidate_repo.py` 并读它指出的文件，弄清动作类型/单位/相机字段之前，不要把输出写到 `0x155`（关节）或 `0x159`。**不要把 12 维输出当作 6 个关节角写到 `0x155`。**
+
+## 硬性约束
+
+- `0x159` 夹爪帧的 set-zero 字节必须为 `0x00`；`0xAE` 会把当前位置写成零点，绝不能发送。不要为开启周期反馈去猜 `0x477` 的 byte 3。
+- 不要回应 `0x710`；`0x1C0`–`0x1C3`、`0x212` 不做解释。
+- Windows 上不要改用 `piper_sdk` / `C_PiperInterface_V2("can0")`、`piper_ros`、`python-can` 的 gs_usb、`pyAgxArm`：都已验证不可用（Linux socketcan 或拒绝访问）。SDK 只用来核对 CAN ID 和字节序。macOS 上用 pyusb 直接发 gs_usb 协议，不经过 python-can。
+- 打开设备必须带 `FILE_FLAG_OVERLAPPED`，否则 `WinUsb_Initialize` 返回错误 6。错误 5 = ArmRobot/VMware USB 服务/残留 Python 进程占用了适配器。
+- 臂处于 `TEACHING` 且 teach=1 时末端位姿命令会被忽略，需先 `exit_drag_teach()`（`0x150`，不是急停）。
+- 文档和新代码里不要写任何人的桌面绝对路径；路径相对于本目录，服务器路径来自 `team_config.json`。
+- 读到的关节角等现场数值不要拷进共享配置。

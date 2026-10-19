@@ -13,6 +13,7 @@ Ctrl+C stops the loop. Operators use USER_GUIDE.md; protocol and code notes are 
 import argparse
 import ctypes
 from ctypes import POINTER, Structure, byref, c_void_p
+import sys
 import time
 
 import msgpack
@@ -166,12 +167,83 @@ def color_camera_index():
     raise RuntimeError("Astra Pro color camera was not found (USB VID_2BC5 PID_0501)")
 
 
+def _avfoundation_devices():
+    """Video devices in OpenCV's macOS index order (sorted by uniqueID), or [] without pyobjc."""
+    try:
+        import AVFoundation
+    except ImportError:
+        return []
+    devices = AVFoundation.AVCaptureDevice.devicesWithMediaType_(AVFoundation.AVMediaTypeVideo)
+    devices = sorted(devices, key=lambda device: str(device.uniqueID()))
+    return [(str(device.localizedName()), str(device.modelID())) for device in devices]
+
+
+def _configured_camera_index():
+    """camera_index in team_config.json wins; on macOS the Astra Pro is otherwise found by USB ID."""
+    from team_config import load
+
+    value = load().get("camera_index")
+    if value not in ("", None):
+        return int(value)
+    # The UVC model ID carries the USB IDs in decimal: 0x2BC5 = 11205, 0x0501 = 1281.
+    for index, (_name, model) in enumerate(_avfoundation_devices()):
+        if "VendorID_11205 ProductID_1281" in model:
+            return index
+    raise RuntimeError(
+        "Astra Pro color camera not found. Plug it in, or set camera_index in team_config.json "
+        "(python policy_link.py cameras lists the indexes)"
+    )
+
+
+def _open_capture(index):
+    import cv2
+
+    if sys.platform == "win32":
+        return cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    if sys.platform == "darwin":
+        return cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+    return cv2.VideoCapture(index)
+
+
+def list_cameras(count=6):
+    """Print every camera index that returns a frame, so the Astra Pro index can be chosen."""
+    if sys.platform == "win32":
+        names = _directshow_names()
+    else:
+        names = [name for name, _model in _avfoundation_devices()]
+    opened = 0
+    for index in range(count):
+        capture = _open_capture(index)
+        try:
+            if not capture.isOpened():
+                continue
+            opened += 1
+            frame = None
+            for _ in range(10):
+                ok, frame = capture.read()
+                if not ok:
+                    frame = None
+            name = names[index] if index < len(names) else ""
+            if frame is None:
+                print(f"camera={index} opened, no frame {name}", flush=True)
+            else:
+                print(f"camera={index} shape={frame.shape} mean={float(frame.mean()):.1f} {name}", flush=True)
+        finally:
+            capture.release()
+    if not opened and sys.platform == "darwin":
+        print(
+            "No camera opened. Allow camera access for the app running this command "
+            "(System Settings > Privacy & Security > Camera), then reopen that app.",
+            flush=True,
+        )
+
+
 def capture_color_bgr():
     """Return one BGR frame from the Astra Pro color camera."""
     import cv2
 
-    index = color_camera_index()
-    capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    index = color_camera_index() if sys.platform == "win32" else _configured_camera_index()
+    capture = _open_capture(index)
     if not capture.isOpened():
         raise RuntimeError(f"could not open Astra Pro color camera at index {index}")
     try:
@@ -187,6 +259,35 @@ def capture_color_bgr():
         return frame
     finally:
         capture.release()
+
+
+def preview(index=None):
+    """Live window of the camera the policy loop uses. q or Esc closes it."""
+    import cv2
+
+    if index is None:
+        index = color_camera_index() if sys.platform == "win32" else _configured_camera_index()
+    capture = _open_capture(index)
+    if not capture.isOpened():
+        raise RuntimeError(f"could not open camera {index}")
+    title = f"camera {index} (q to quit)"
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                continue
+            rgb = np.ascontiguousarray(frame[:, :, ::-1])
+            model_view = resize_with_pad(rgb, IMAGE_SHAPE[0], IMAGE_SHAPE[1])[:, :, ::-1]
+            height = frame.shape[0]
+            inset = cv2.resize(model_view, (height // 3, height // 3), interpolation=cv2.INTER_NEAREST)
+            frame[: inset.shape[0], : inset.shape[1]] = inset
+            cv2.putText(frame, "model input 224x224", (8, inset.shape[0] + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.imshow(title, frame)
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                break
+    finally:
+        capture.release()
+        cv2.destroyAllWindows()
 
 
 def capture_color():
@@ -244,6 +345,8 @@ def build_observation(state, image):
         "observation/wrist_image": image.copy(),
         "observation/right_image": image.copy(),
         "observation/state": robocasa_state(state),
+        # Extra key for scripted servers that command joints; model servers ignore it.
+        "observation/joints_deg": np.asarray(state["joints_deg"], dtype=np.float32),
         "prompt": "reach the pen",
     }
 
@@ -298,16 +401,20 @@ def serve(host, port):
         server.serve_forever()
 
 
-def _apply_in_subprocess(actions):
+def _apply_in_subprocess(actions, action_space="ee_delta", speed=None, freq=None):
     """Run the CAN command in a fresh process. The camera and WinUSB crash if combined."""
     import subprocess
-    import sys
     import tempfile
     from pathlib import Path
 
     path = Path(tempfile.gettempdir()) / "piper_policy_actions.npy"
     np.save(path, np.asarray(actions))
-    subprocess.check_call([sys.executable, str(Path(__file__).with_name("policy_step.py")), "apply", str(path)])
+    command = [sys.executable, str(Path(__file__).with_name("policy_step.py")), "apply", str(path), action_space]
+    if speed is not None:
+        command += ["--speed", str(speed)]
+    if freq is not None:
+        command += ["--freq", str(freq)]
+    subprocess.check_call(command)
 
 
 def _connect_policy(host, port):
@@ -330,7 +437,7 @@ def _recv_actions(websocket):
     return result, np.asarray(result["actions"])
 
 
-def infer_once(host, port):
+def infer_once(host, port, speed=None, freq=None):
     """Read, infer, and execute until Ctrl+C. The server connection stays open."""
     connection = _connect_policy(host, port)
     with connection as websocket:
@@ -353,20 +460,30 @@ def infer_once(host, port):
                 print(format_state(state), flush=True)
                 websocket.send(packb(observation))
                 print("waiting_for_inference", flush=True)
-                _result, actions = _recv_actions(websocket)
-                print(f"actions_shape={tuple(actions.shape)}", flush=True)
+                result, actions = _recv_actions(websocket)
+                action_space = str(result.get("action_space", "ee_delta"))
+                print(f"actions_shape={tuple(actions.shape)} action_space={action_space}", flush=True)
                 print("applying", flush=True)
-                _apply_in_subprocess(actions)
+                _apply_in_subprocess(actions, action_space, speed=speed, freq=freq)
         except KeyboardInterrupt:
             print("stopped", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("serve", "once"))
+    parser.add_argument("mode", choices=("serve", "once", "cameras", "preview"))
+    parser.add_argument("--index", type=int, help="camera index for preview; default is the policy camera")
+    parser.add_argument("--speed", type=int, help="joint speed percent for joint actions; default joint_speed in team_config.json")
+    parser.add_argument("--freq", type=float, help="joint target updates per second; 20 holds one target per step; default 100")
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int)
     args = parser.parse_args()
+    if args.mode == "cameras":
+        list_cameras()
+        return
+    if args.mode == "preview":
+        preview(args.index)
+        return
     port = args.port
     if port is None:
         port = PORT
@@ -377,7 +494,7 @@ def main():
     if args.mode == "serve":
         serve(args.host, port)
     else:
-        infer_once(args.host, port)
+        infer_once(args.host, port, speed=args.speed, freq=args.freq)
 
 
 if __name__ == "__main__":
