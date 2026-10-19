@@ -87,33 +87,27 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 
 ## Record a demonstration
 
-This only stores a person dragging the arm. The program reads the arm and the camera and never moves the arm. Turn on drag-teach, then run this in this folder with the task sentence in quotes (on a Mac use `.venv/bin/python` and `/` in paths):
+This only stores a person dragging the arm. The program reads the arm and the camera and never moves the arm. Turn on drag-teach, then run this in this folder with the task sentence in quotes (on a Mac use `.venv/bin/python`):
 
 ```powershell
-python episode_recorder.py --task "put the pen in the box"
+python collect.py --task "put the pen in the box"
 ```
 
 When the attempt is over, press one key in the same window (no Enter needed):
 
 | Key | Result |
 | --- | --- |
-| `s` | Success, can be exported |
+| `s` | Success, then the same command checks and exports it |
 | `f` | Failure, kept but not exported |
 | `d` | Discard |
 
-It prints an `episodes\episode_...` folder. Check it with that name:
+The folder name is filled in by the program. Do not copy it into another command. `teaching_fraction` should be close to 1 and `frames_missing` should be 0. After `s`, the result is in the `export` folder printed at the end. Flagged steps are not used for training. The rules are in `数据采集.md`.
+
+To check and export the newest episode already on disk:
 
 ```powershell
-python episode_check.py episodes\episode_...
+python collect.py --latest
 ```
-
-`teaching_fraction` should be close to 1 and `frames_missing` should be 0. Export only episodes marked `s`:
-
-```powershell
-python dataset_export.py episodes\episode_...
-```
-
-The result is in that folder's `export`. Flagged steps are not used for training. The rules are in `数据采集.md`.
 
 ## Run once
 

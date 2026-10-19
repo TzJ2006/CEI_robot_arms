@@ -52,6 +52,7 @@ Python packages used here are `numpy`, `opencv-python`, `msgpack`, and `websocke
 | `check_candidate_repo.py` | Search a candidate policy repo before changing the action mapping |
 | `_can_listen.py` | Receive-only CAN capture |
 | `_realsense_test.py` | Save one Astra Pro color frame |
+| `collect.py` | One command for a training episode: record, check, and export after `s`. `--latest` does the last two for the newest episode |
 | `episode_recorder.py` | Read-only drag-teach episode: arm feedback, one Astra frame, start and success or failure |
 | `episode_check.py` | Print the episode timeline and save pose curves beside frames |
 | `dataset_export.py` | Resample a successful drag episode to 0.05 s. Intervals that are not teach mode, lack a fresh image, or jump are masked out of training |
