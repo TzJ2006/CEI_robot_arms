@@ -22,6 +22,12 @@ DEFAULT_JOINT_UPDATE_HZ = 100.0
 # 0.05 s per step, so 3 degrees per step caps joint speed near 60 deg/s.
 MAX_JOINT_STEP_DEG = 3.0
 DEFAULT_MAX_CHUNK_JOINT_DEG = 100.0
+# Exit status of `apply` when a chunk fails a limit check; nothing was sent.
+REFUSED_EXIT = 3
+
+
+class ChunkRefused(RuntimeError):
+    """A limit check failed before any frame was sent."""
 
 
 def _rx(deg):
@@ -76,8 +82,11 @@ def _axis_angle_matrix(rotation_vector):
     return c * np.eye(3) + s * cross + (1 - c) * np.outer(axis, axis)
 
 
-def action_waypoints(actions, pose):
-    """Integrate every policy step. Position is millimeters in the arm base frame."""
+def action_waypoints(actions, pose, scale=1.0):
+    """Integrate every policy step. Position is millimeters in the arm base frame.
+
+    scale multiplies translation and rotation (ee_delta_scale in team_config.json).
+    """
     position = np.array([pose["x"], pose["y"], pose["z"]], dtype=float)
     start = position.copy()
     rotation = euler_to_matrix(pose["rx"], pose["ry"], pose["rz"])
@@ -90,9 +99,9 @@ def action_waypoints(actions, pose):
     use_rotation = euler_error <= 1.0
     waypoints = []
     for step in actions:
-        position = position + np.asarray(step[0:3], dtype=float) * 0.05 * 1000.0
+        position = position + np.asarray(step[0:3], dtype=float) * 0.05 * 1000.0 * scale
         if use_rotation:
-            rotation = _axis_angle_matrix(np.asarray(step[3:6], dtype=float) * 0.5) @ rotation
+            rotation = _axis_angle_matrix(np.asarray(step[3:6], dtype=float) * 0.5 * scale) @ rotation
             rx, ry, rz = matrix_to_euler(rotation)
         else:
             rx, ry, rz = pose["rx"], pose["ry"], pose["rz"]
@@ -123,7 +132,7 @@ def check_limits(waypoints, pose, config):
         float(np.linalg.norm(np.array([w["x"], w["y"], w["z"]]) - start)) for w in waypoints
     )
     if reach > limit:
-        raise RuntimeError(f"chunk reaches {reach:.1f} mm from the start pose; max_chunk_shift_mm={limit:.1f}. Nothing sent")
+        raise ChunkRefused(f"chunk reaches {reach:.1f} mm from the start pose; max_chunk_shift_mm={limit:.1f}. Nothing sent")
     box = config.get("workspace_mm") or {}
     for index, waypoint in enumerate(waypoints):
         for axis, bounds in box.items():
@@ -131,26 +140,35 @@ def check_limits(waypoints, pose, config):
                 continue
             low, high = bounds
             if not low <= waypoint[axis] <= high:
-                raise RuntimeError(
+                raise ChunkRefused(
                     f"step {index} {axis}={waypoint[axis]:.1f} mm is outside workspace_mm {axis}=[{low}, {high}]. Nothing sent"
                 )
     return reach
 
 
 def apply_actions(actions):
-    """Enable the arm and play every step in the returned chunk."""
+    """Enable the arm and play the returned chunk.
+
+    execute_steps in team_config.json keeps only the first N steps (empty: all),
+    and ee_delta_scale scales each step (empty: 1.0). A simulator-trained OSC
+    policy's full chunk integrates to far more than the arm actually moved there.
+    """
     actions = np.asarray(actions)
+    config = load_config()
+    if config.get("execute_steps"):
+        actions = actions[: int(config["execute_steps"])]
+    scale = float(config.get("ee_delta_scale") or 1.0)
     with PiperClient() as robot:
         before = robot.read_state()
         if not before["complete"]:
             raise RuntimeError("arm feedback is incomplete")
-        waypoints, shift_mm, euler_error = action_waypoints(actions, before["pose_mm_deg"])
+        waypoints, shift_mm, euler_error = action_waypoints(actions, before["pose_mm_deg"], scale)
         if not waypoints:
             raise RuntimeError("policy returned no actions")
-        reach_mm = check_limits(waypoints, before["pose_mm_deg"], load_config())
+        reach_mm = check_limits(waypoints, before["pose_mm_deg"], config)
         final = waypoints[-1]
         print(
-            f"command_steps={len(waypoints)} shift_mm={shift_mm:.2f} reach_mm={reach_mm:.2f} "
+            f"command_steps={len(waypoints)} scale={scale:g} shift_mm={shift_mm:.2f} reach_mm={reach_mm:.2f} "
             f"euler_roundtrip_deg={euler_error:.3f} gripper_close={final['gripper_close']}",
             flush=True,
         )
@@ -196,11 +214,11 @@ def check_joint_chunk(actions, start, config):
     for index, step in enumerate(actions[:, :6]):
         jump = float(np.max(np.abs(step - previous)))
         if jump > MAX_JOINT_STEP_DEG:
-            raise RuntimeError(f"step {index} moves a joint {jump:.1f} deg in one step (max {MAX_JOINT_STEP_DEG}). Nothing sent")
+            raise ChunkRefused(f"step {index} moves a joint {jump:.1f} deg in one step (max {MAX_JOINT_STEP_DEG}). Nothing sent")
         previous = step
     reach = float(np.max(np.abs(actions[:, :6] - np.asarray(start, dtype=float))))
     if reach > limit:
-        raise RuntimeError(f"chunk moves a joint {reach:.1f} deg from the start; max_chunk_joint_deg={limit:.1f}. Nothing sent")
+        raise ChunkRefused(f"chunk moves a joint {reach:.1f} deg from the start; max_chunk_joint_deg={limit:.1f}. Nothing sent")
     return reach
 
 
@@ -259,10 +277,14 @@ def main():
         parser.add_argument("--speed", type=int)
         parser.add_argument("--freq", type=float)
         args = parser.parse_args()
-        if args.action_space == "joints":
-            apply_joint_actions(np.load(args.path), speed=args.speed, update_hz=args.freq)
-        else:
-            apply_actions(np.load(args.path))
+        try:
+            if args.action_space == "joints":
+                apply_joint_actions(np.load(args.path), speed=args.speed, update_hz=args.freq)
+            else:
+                apply_actions(np.load(args.path))
+        except ChunkRefused as exc:
+            print(f"chunk_refused {exc}", flush=True)
+            sys.exit(REFUSED_EXIT)
         return
     infer_once("127.0.0.1", 8000)
 
