@@ -45,6 +45,7 @@ flowchart TB
 | `policy_step.py` | Integrates one action chunk into an end-effector trajectory in the base frame and writes it to CAN. It does not import `piper_sdk` at runtime |
 | `team_config.json` | Login account, SSH alias, checkpoint, and log directory. This is the only file to edit when the environment changes |
 | `team_config.py` | `run` submits the job, waits until it listens, opens one local forward, and starts continuous control. `once` starts another round while the forward is up. `down` cancels the job and closes the forward. `job` and `serve` still only print commands |
+| `simple_policy_server.py` | Scripted policy server for testing the link without a model. See [macOS and the simple server](#macos-and-the-simple-server) |
 | `USER_GUIDE.md` | Operating steps |
 | `用户文档.md` | Operating steps in Chinese |
 | `_can_listen.py` | Capture that receives only and transmits nothing. The log is `_can_listen_log.txt` in this directory |
@@ -144,7 +145,36 @@ Do not change the msgpack packing. With only one Astra Pro, say that all three f
 
 Every returned step becomes a waypoint and is sent at 0.05 s with speed 50%. A chunk is no longer cut off at 10 mm or 5 degrees. After the chunk, `policy_link.py` requests the next one with a new image and state. Verified: after leaving teach mode, the arm followed one chunk's final pose, with `motion=0`.
 
-## Device ownership
+## macOS and the simple server
+
+Not yet verified on hardware. `piper_client.py` chooses the transport by platform: `_WinUsbTransport` on Windows and `_LibUsbTransport` (pyusb, VID `1D50` / PID `606F`) elsewhere. `open_transport()` sends the same gs_usb control transfers for both, and the 20-byte frames, echo draining, and every CAN ID are shared. `_can_listen.py` uses the libusb transport off Windows.
+
+The libusb transport drains the IN endpoint from a background thread into a 256-frame queue (about 0.1 s of feedback; the oldest frame is dropped when full). Without that, feedback at about 2,700 frames/s exhausts the adapter's frame buffers and OUT writes time out with errno 60 after about a dozen frames. Do not go back to reading only between writes.
+
+Setup on a Mac:
+
+```bash
+brew install libusb
+python3 -m venv .venv
+.venv/bin/pip install numpy msgpack 'websockets>=13' opencv-python pyusb pyobjc-framework-AVFoundation
+```
+
+OpenCV on macOS numbers cameras in `uniqueID` order and cannot select one by USB ID. `_avfoundation_devices()` rebuilds that order through pyobjc, and the Astra Pro is the device whose model ID contains `VendorID_11205 ProductID_1281` (0x2BC5 / 0x0501). A non-empty `camera_index` in `team_config.json` overrides it. `python policy_link.py cameras` lists indexes with names. `python policy_link.py preview [--index N]` opens a live window with the 224×224 model input inset; q closes it. Camera access must be allowed for the app that runs the command.
+
+`policy_step.check_limits()` runs before any frame is sent. A waypoint farther than `max_chunk_shift_mm` (default 30) from the pose read before the chunk, or outside the absolute base-frame box `workspace_mm` (`{"x": [min, max], ...}`; an empty axis is skipped), raises and sends nothing.
+
+`simple_policy_server.py` returns a scripted `(50, 12)` chunk with the action meaning in `action_waypoints()`: +X by 10 mm and back, and the gripper alternating between chunks. With `server_mode` set to `"simple"`, `team_config.py setup-remote` copies it, `policy_link.py`, and `piper_client.py` to `remote_code_dir` and builds a venv there; `run` then submits it without a GPU. `"openpi"` keeps the `serve_policy.py` launch. Off Windows, the local forward is `ssh -f -N -L` in the background, and `down` stops it with `pkill`.
+
+## Joint-space actions
+
+End-pose (MOVE P) targets from the folded rest pose are rejected by the arm's IK: status shows `TARGET_EXCEEDS_LIMIT` and only the gripper moves. A reply may therefore carry `"action_space": "joints"` with actions `(N, 7)`: six absolute joint angles in degrees and a gripper value (at or above 0.5 closes). `policy_link.py` passes the action space to `policy_step.py apply`; a reply without it is `ee_delta`.
+
+`apply_joint_actions()` sends MOVE J (`0x151` byte 1 = `0x01`) and joints on `0x155` (J1, J2), `0x156` (J3, J4), `0x157` (J5, J6), big-endian int32 in 0.001 degrees, at 0.05 s per step, speed `joint_speed` (default 60%). Within each step `move_joints(start_deg=...)` interpolates from the previous target and resends about every 5–7 ms (about 140 Hz). MOVE J plans to each new target, so holding one target per 0.05 s step made J1 and J2 start and stop on every step; at 30% the arm also lagged the commanded rate. Before anything is sent, `check_joint_chunk()` refuses a step that moves any joint more than 3 degrees, or a chunk that moves a joint more than `max_chunk_joint_deg` (default 100) from the start. `move_joints()` refuses targets more than 2 degrees outside `JOINT_LIMITS_DEG` and clamps smaller excursions. The observation carries `observation/joints_deg` for scripted servers.
+
+`simple_policy_server.py --mode demo` (the default) unfolds to `READY_DEG = [0, 45, -45, 0, 30, 0]` at half speed, then cycles a J1 wave (±30), a J5 nod with a J2/J3 reach, and a ±90 J6 twist with the gripper. Segment lengths scale so no joint exceeds 2.4 degrees per step. `--mode nudge` keeps the end-effector test.
+
+In low-speed feedback `0x261`–`0x266`, the driver-enabled flag is bit 6 of byte 5 (0-based).
+
 
 The adapter is a candleLight, `VID_1D50` / `PID_606F`, WinUSB, interface GUID `{c15b4308-04d3-11e6-b3ea-6057189e6443}`, CAN clock 48 MHz.
 

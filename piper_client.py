@@ -1,10 +1,17 @@
-"""Local Piper client over candleLight WinUSB.
+"""Local Piper client over a candleLight (gs_usb) adapter.
 
 Reads joint angles, gripper opening, end-effector pose, and 0x2A1 status.
 Gripper motion is separate and does not enable the arm joints.
+
+Windows talks to the adapter through WinUSB; macOS and Linux use libusb via
+pyusb. Both send the same gs_usb control transfers and 20-byte frames.
 """
 import ctypes
+import math
+import queue
 import struct
+import sys
+import threading
 import time
 from ctypes import (
     POINTER,
@@ -21,6 +28,8 @@ from ctypes import (
 from uuid import UUID
 
 INTERFACE_GUID = "{c15b4308-04d3-11e6-b3ea-6057189e6443}"
+USB_VENDOR_ID = 0x1D50
+USB_PRODUCT_ID = 0x606F
 CTRL_MODE = {
     0x00: "STANDBY",
     0x01: "CAN_CTRL",
@@ -44,6 +53,15 @@ ARM_STATUS = {
     0x09: "JOINT_STATUS_ERR",
     0x0A: "OTHER_ERR",
 }
+# Piper joint limits in degrees, from piper_sdk. J2 and J3 rest near 0 in the folded pose.
+JOINT_LIMITS_DEG = (
+    (-150.0, 150.0),
+    (0.0, 180.0),
+    (-170.0, 0.0),
+    (-100.0, 100.0),
+    (-70.0, 70.0),
+    (-120.0, 120.0),
+)
 MODE_FEED = {
     0x00: "MOVE_P",
     0x01: "MOVE_J",
@@ -130,8 +148,8 @@ def _can_frame(arbitration_id, data):
     return struct.pack("<2I12B", 0, arbitration_id, 8, 0, 0, 0, *payload)
 
 
-class PiperClient:
-    """Read Piper feedback and command the gripper over candleLight."""
+class _WinUsbTransport:
+    """candleLight through WinUSB with overlapped I/O."""
 
     def __init__(self):
         self._kernel = None
@@ -146,14 +164,7 @@ class PiperClient:
         self._write_buffer = None
         self._write_overlapped = None
 
-    def __enter__(self):
-        self.connect()
-        return self
-
-    def __exit__(self, exc_type, exc, traceback):
-        self.close()
-
-    def connect(self):
+    def open(self):
         kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         winusb = ctypes.WinDLL("winusb", use_last_error=True)
         kernel.CreateFileW.restype = c_void_p
@@ -195,12 +206,12 @@ class PiperClient:
         try:
             self._read_event = kernel.CreateEventW(None, True, False, None)
             self._write_event = kernel.CreateEventW(None, True, False, None)
-            self._start_bus()
+            self._query_pipes()
         except Exception:
             self.close()
             raise
 
-    def _start_bus(self):
+    def _query_pipes(self):
         winusb = self._winusb
         interface = self._interface
         self._in_pipe = 0x81
@@ -213,11 +224,6 @@ class PiperClient:
                 self._in_pipe = info.PipeId
             elif info.PipeType == 2:
                 self._out_pipe = info.PipeId
-        _feature, clock = struct.unpack_from("<2I", self._control(0xC1, 4, length=40))
-        prescaler = 3 if clock == 48_000_000 else 5
-        self._control(0x41, 0, struct.pack("<I", 0x0000BEEF))
-        self._control(0x41, 1, struct.pack("<5I", 1, 12, 2, 1, prescaler))
-        self._control(0x41, 2, struct.pack("<II", 1, 0))
 
     def close(self):
         kernel = self._kernel
@@ -234,6 +240,235 @@ class PiperClient:
             if handle and kernel:
                 kernel.CloseHandle(handle)
                 setattr(self, name, None)
+
+    def control(self, request_type, request, payload=b"", length=0):
+        size = length or len(payload)
+        packet = SETUP(request_type, request, 0, 0, size)
+        buffer = ctypes.create_string_buffer(max(size, 1))
+        if payload:
+            buffer.raw = payload
+        transferred = c_ulong(0)
+        ok = self._winusb.WinUsb_ControlTransfer(
+            self._interface, packet, buffer, max(size, 1), byref(transferred), None
+        )
+        if not ok:
+            raise OSError(f"ctrl {request:#x} failed err={ctypes.get_last_error()}")
+        return buffer.raw[: transferred.value]
+
+    def read(self, wait_ms=30):
+        """Return one raw 20-byte gs_usb frame, or None."""
+        overlapped = OVERLAPPED()
+        overlapped.hEvent = self._read_event
+        self._kernel.ResetEvent(self._read_event)
+        transferred = c_ulong(0)
+        ok = self._winusb.WinUsb_ReadPipe(
+            self._interface, self._in_pipe, self._buffer, 20, byref(transferred), byref(overlapped)
+        )
+        if not ok:
+            if ctypes.get_last_error() != 997:
+                return None
+            if self._kernel.WaitForSingleObject(self._read_event, wait_ms) != 0:
+                self._kernel.CancelIoEx(self._device, ctypes.addressof(overlapped))
+                self._kernel.WaitForSingleObject(self._read_event, 50)
+                return None
+            got = wintypes.DWORD()
+            if not self._kernel.GetOverlappedResult(self._device, byref(overlapped), byref(got), False):
+                return None
+            transferred = c_ulong(got.value)
+        return bytes(self._buffer.raw[: transferred.value])
+
+    def write(self, frame):
+        """Write one gs_usb frame and wait until the driver finishes with the buffer."""
+        self._write_buffer = ctypes.create_string_buffer(frame)
+        self._write_overlapped = OVERLAPPED()
+        self._write_overlapped.hEvent = self._write_event
+        self._kernel.ResetEvent(self._write_event)
+        transferred = c_ulong(0)
+        ok = self._winusb.WinUsb_WritePipe(
+            self._interface,
+            self._out_pipe,
+            self._write_buffer,
+            len(frame),
+            byref(transferred),
+            byref(self._write_overlapped),
+        )
+        if not ok and ctypes.get_last_error() != 997:
+            raise OSError(f"CAN write failed err={ctypes.get_last_error()}")
+        if not ok:
+            deadline = time.perf_counter() + 0.5
+            finished = False
+            while time.perf_counter() < deadline:
+                if self._kernel.WaitForSingleObject(self._write_event, 0) == 0:
+                    finished = True
+                    break
+                self.read(wait_ms=5)
+            if not finished:
+                self._kernel.CancelIoEx(self._device, ctypes.addressof(self._write_overlapped))
+                self._kernel.WaitForSingleObject(self._write_event, 200)
+                raise OSError("CAN write timed out")
+            got = wintypes.DWORD()
+            if not self._kernel.GetOverlappedResult(self._device, byref(self._write_overlapped), byref(got), False):
+                raise OSError(f"CAN write result failed err={ctypes.get_last_error()}")
+
+
+class _LibUsbTransport:
+    """candleLight through libusb (pyusb). Used on macOS and Linux.
+
+    Feedback arrives at about 2,700 frames/s. If the IN endpoint is not drained
+    continuously, the adapter runs out of frame buffers and stops accepting
+    OUT transfers (writes time out with errno 60). A background thread reads
+    every frame into a bounded queue; read() takes from that queue.
+    """
+
+    # About 0.1 s of feedback, so read_state() never sees a stale backlog.
+    QUEUE_FRAMES = 256
+
+    def __init__(self):
+        self._usb = None
+        self._device = None
+        self._in_pipe = 0x81
+        self._out_pipe = 0x02
+        self._frames = None
+        self._reader = None
+        self._running = False
+
+    def open(self):
+        try:
+            import usb.core
+            import usb.util
+        except ImportError as exc:
+            raise OSError("pyusb is missing: pip install pyusb, and brew install libusb on macOS") from exc
+        device = usb.core.find(idVendor=USB_VENDOR_ID, idProduct=USB_PRODUCT_ID)
+        if device is None:
+            raise OSError(f"candleLight {USB_VENDOR_ID:04x}:{USB_PRODUCT_ID:04x} not found on USB")
+        try:
+            if device.is_kernel_driver_active(0):
+                device.detach_kernel_driver(0)
+        except (NotImplementedError, usb.core.USBError):
+            pass
+        try:
+            device.get_active_configuration()
+        except usb.core.USBError:
+            device.set_configuration()
+        usb.util.claim_interface(device, 0)
+        interface = device.get_active_configuration()[(0, 0)]
+        for endpoint in interface:
+            if usb.util.endpoint_type(endpoint.bmAttributes) != usb.util.ENDPOINT_TYPE_BULK:
+                continue
+            if usb.util.endpoint_direction(endpoint.bEndpointAddress) == usb.util.ENDPOINT_IN:
+                self._in_pipe = endpoint.bEndpointAddress
+            else:
+                self._out_pipe = endpoint.bEndpointAddress
+        self._usb = usb
+        self._device = device
+        self._frames = queue.Queue(maxsize=self.QUEUE_FRAMES)
+
+    def start_reader(self):
+        """Begin draining the IN endpoint. Called once the bus is started."""
+        self._running = True
+        self._reader = threading.Thread(target=self._drain, name="candlelight-reader", daemon=True)
+        self._reader.start()
+
+    def _drain(self):
+        usb = self._usb
+        while self._running:
+            try:
+                raw = bytes(self._device.read(self._in_pipe, 64, timeout=50))
+            except usb.core.USBTimeoutError:
+                continue
+            except usb.core.USBError:
+                if not self._running:
+                    break
+                time.sleep(0.01)
+                continue
+            try:
+                self._frames.put_nowait(raw)
+            except queue.Full:
+                # Keep the newest feedback: drop the oldest frame.
+                try:
+                    self._frames.get_nowait()
+                except queue.Empty:
+                    pass
+                self._frames.put_nowait(raw)
+
+    def close(self):
+        self._running = False
+        if self._reader is not None:
+            self._reader.join(timeout=0.5)
+            self._reader = None
+        if self._device is not None:
+            self._usb.util.release_interface(self._device, 0)
+            self._usb.util.dispose_resources(self._device)
+            self._device = None
+
+    def control(self, request_type, request, payload=b"", length=0):
+        try:
+            if request_type & 0x80:
+                return bytes(self._device.ctrl_transfer(request_type, request, 0, 0, length, timeout=1000))
+            self._device.ctrl_transfer(request_type, request, 0, 0, payload, timeout=1000)
+            return b""
+        except self._usb.core.USBError as exc:
+            raise OSError(f"ctrl {request:#x} failed: {exc}") from exc
+
+    def read(self, wait_ms=30):
+        """Return one raw 20-byte gs_usb frame, or None."""
+        if self._reader is None:
+            try:
+                return bytes(self._device.read(self._in_pipe, 64, timeout=max(1, int(wait_ms))))
+            except self._usb.core.USBError:
+                return None
+        try:
+            return self._frames.get(timeout=max(0.001, wait_ms / 1000))
+        except queue.Empty:
+            return None
+
+    def write(self, frame):
+        try:
+            self._device.write(self._out_pipe, frame, timeout=500)
+        except self._usb.core.USBError as exc:
+            raise OSError(f"CAN write failed: {exc}") from exc
+
+
+def open_transport():
+    """Open the adapter and start the bus at 1 Mbps. The caller closes it."""
+    transport = _WinUsbTransport() if sys.platform == "win32" else _LibUsbTransport()
+    transport.open()
+    try:
+        _feature, clock = struct.unpack_from("<2I", transport.control(0xC1, 4, length=40))
+        prescaler = 3 if clock == 48_000_000 else 5
+        transport.control(0x41, 0, struct.pack("<I", 0x0000BEEF))
+        transport.control(0x41, 1, struct.pack("<5I", 1, 12, 2, 1, prescaler))
+        transport.control(0x41, 2, struct.pack("<II", 1, 0))
+        if hasattr(transport, "start_reader"):
+            transport.start_reader()
+    except Exception:
+        transport.close()
+        raise
+    transport.clock = clock
+    return transport
+
+
+class PiperClient:
+    """Read Piper feedback and command the gripper over candleLight."""
+
+    def __init__(self):
+        self._transport = None
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+
+    def connect(self):
+        self._transport = open_transport()
+
+    def close(self):
+        """Release the adapter. The bus-stop control transfer is not sent; it hung the process."""
+        if self._transport is not None:
+            self._transport.close()
+            self._transport = None
 
     def read_state(self, timeout=0.6):
         """Return the latest feedback. Missing fields stay None."""
@@ -297,6 +532,63 @@ class PiperClient:
         speed = int(max(0, min(100, speed)))
         self._write_frame(_can_frame(0x151, bytes([0x01, 0x00, speed, 0x00, 0, 0, 0, 0])))
 
+    def set_joint_mode(self, speed=10):
+        """CAN control, MOVE J, speed 0-100. Installation byte stays 0."""
+        speed = int(max(0, min(100, speed)))
+        self._write_frame(_can_frame(0x151, bytes([0x01, 0x01, speed, 0x00, 0, 0, 0, 0])))
+
+    def move_joints(
+        self, joints_deg, duration=0.05, speed=30, gripper_mm=None, start_deg=None, update_hz=100.0, tolerance_deg=2.0
+    ):
+        """Send six absolute joint angles (degrees) through 0x155-0x157 for duration seconds.
+
+        With start_deg, the target moves from start_deg to joints_deg over
+        duration, changing update_hz times per second (frames are resent every
+        few ms either way). MOVE J plans to each new target, so update_hz=20
+        with 0.05 s steps holds one target per step and the heavy base joints
+        start and stop on every step; around 100 Hz the motion is continuous.
+
+        Raises before sending if a target is more than tolerance_deg outside
+        JOINT_LIMITS_DEG; smaller excursions are clamped to the limit.
+        """
+        end = self._checked_joints(joints_deg, tolerance_deg)
+        begin = end if start_deg is None else self._checked_joints(start_deg, tolerance_deg)
+        gripper_frame = None
+        if gripper_mm is not None:
+            gripper_frame = _can_frame(0x159, struct.pack(">iHBB", int(round(gripper_mm * 1000)), 1000, 0x01, 0))
+        self.set_joint_mode(speed=speed)
+        period = 1.0 / max(1.0, float(update_hz))
+        started = time.perf_counter()
+        last_mode = started
+        while True:
+            now = time.perf_counter()
+            elapsed = now - started
+            if elapsed >= duration:
+                break
+            if now - last_mode >= 0.05:
+                self.set_joint_mode(speed=speed)
+                last_mode = now
+            # The target advances once per update period, to where it should be at the end of that period.
+            alpha = min(1.0, (math.floor(elapsed / period) + 1) * period / duration) if duration > 0 else 1.0
+            raw = [int(round((b + (e - b) * alpha) * 1000)) for b, e in zip(begin, end)]
+            self._write_frame(_can_frame(0x155, struct.pack(">ii", raw[0], raw[1])))
+            self._write_frame(_can_frame(0x156, struct.pack(">ii", raw[2], raw[3])))
+            self._write_frame(_can_frame(0x157, struct.pack(">ii", raw[4], raw[5])))
+            if gripper_frame is not None:
+                self._write_frame(gripper_frame)
+            time.sleep(0.003)
+
+    @staticmethod
+    def _checked_joints(joints_deg, tolerance_deg):
+        if len(joints_deg) != 6:
+            raise ValueError("move_joints needs six angles")
+        targets = []
+        for index, (value, (low, high)) in enumerate(zip(joints_deg, JOINT_LIMITS_DEG)):
+            if not low - tolerance_deg <= value <= high + tolerance_deg:
+                raise ValueError(f"J{index + 1}={value:.1f} deg is outside [{low}, {high}]")
+            targets.append(min(high, max(low, float(value))))
+        return targets
+
     def move_pose(self, x_mm, y_mm, z_mm, rx_deg, ry_deg, rz_deg, duration=1.5, speed=50, gripper_mm=None):
         """Send one absolute end pose in the arm base frame. Units are mm and degrees."""
         xy = struct.pack(">ii", int(round(x_mm * 1000)), int(round(y_mm * 1000)))
@@ -316,41 +608,9 @@ class PiperClient:
                 self._write_frame(frame)
             time.sleep(0.01)
 
-    def _control(self, request_type, request, payload=b"", length=0):
-        size = length or len(payload)
-        packet = SETUP(request_type, request, 0, 0, size)
-        buffer = ctypes.create_string_buffer(max(size, 1))
-        if payload:
-            buffer.raw = payload
-        transferred = c_ulong(0)
-        ok = self._winusb.WinUsb_ControlTransfer(
-            self._interface, packet, buffer, max(size, 1), byref(transferred), None
-        )
-        if not ok:
-            raise OSError(f"ctrl {request:#x} failed err={ctypes.get_last_error()}")
-        return buffer.raw[: transferred.value]
-
     def _read_frame(self, wait_ms=30):
-        overlapped = OVERLAPPED()
-        overlapped.hEvent = self._read_event
-        self._kernel.ResetEvent(self._read_event)
-        transferred = c_ulong(0)
-        ok = self._winusb.WinUsb_ReadPipe(
-            self._interface, self._in_pipe, self._buffer, 20, byref(transferred), byref(overlapped)
-        )
-        if not ok:
-            if ctypes.get_last_error() != 997:
-                return None
-            if self._kernel.WaitForSingleObject(self._read_event, wait_ms) != 0:
-                self._kernel.CancelIoEx(self._device, ctypes.addressof(overlapped))
-                self._kernel.WaitForSingleObject(self._read_event, 50)
-                return None
-            got = wintypes.DWORD()
-            if not self._kernel.GetOverlappedResult(self._device, byref(overlapped), byref(got), False):
-                return None
-            transferred = c_ulong(got.value)
-        raw = bytes(self._buffer.raw[: transferred.value])
-        if len(raw) < 20:
+        raw = self._transport.read(wait_ms=wait_ms)
+        if raw is None or len(raw) < 20:
             return None
         echo, can_id, dlc = struct.unpack_from("<IIB", raw)
         if echo != 0xFFFFFFFF or can_id & 0x20000000:
@@ -358,39 +618,10 @@ class PiperClient:
         return can_id & 0x7FF, raw[12:12 + min(dlc, 8)]
 
     def _write_frame(self, frame):
-        """Write one gs_usb frame and wait until the driver finishes with the buffer."""
-        self._write_buffer = ctypes.create_string_buffer(frame)
-        self._write_overlapped = OVERLAPPED()
-        self._write_overlapped.hEvent = self._write_event
-        self._kernel.ResetEvent(self._write_event)
-        transferred = c_ulong(0)
-        ok = self._winusb.WinUsb_WritePipe(
-            self._interface,
-            self._out_pipe,
-            self._write_buffer,
-            len(frame),
-            byref(transferred),
-            byref(self._write_overlapped),
-        )
-        if not ok and ctypes.get_last_error() != 997:
-            raise OSError(f"CAN write failed err={ctypes.get_last_error()}")
-        if not ok:
-            deadline = time.perf_counter() + 0.5
-            finished = False
-            while time.perf_counter() < deadline:
-                if self._kernel.WaitForSingleObject(self._write_event, 0) == 0:
-                    finished = True
-                    break
-                self._read_frame(wait_ms=5)
-            if not finished:
-                self._kernel.CancelIoEx(self._device, ctypes.addressof(self._write_overlapped))
-                self._kernel.WaitForSingleObject(self._write_event, 200)
-                raise OSError("CAN write timed out")
-            got = wintypes.DWORD()
-            if not self._kernel.GetOverlappedResult(self._device, byref(self._write_overlapped), byref(got), False):
-                raise OSError(f"CAN write result failed err={ctypes.get_last_error()}")
+        """Write one frame, then drain the transmit echo so later writes do not stall."""
+        self._transport.write(frame)
         for _ in range(4):
-            if self._read_frame(wait_ms=2) is None:
+            if self._transport.read(wait_ms=2) is None:
                 break
         return True
 

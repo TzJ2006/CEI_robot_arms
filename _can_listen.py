@@ -1,6 +1,7 @@
 """Passive candleLight capture. Opens the adapter only; sends no CAN frames."""
 import ctypes
 import struct
+import sys
 import time
 from ctypes import (
     POINTER,
@@ -107,7 +108,54 @@ def device_path():
     return detail.DevicePath
 
 
+def format_row(ts, raw):
+    if len(raw) < 20:
+        return f"{ts:.6f}\tSHORT\t{raw.hex()}"
+    echo, can_id, dlc, channel, flags, _reserved = struct.unpack_from("<IIBBBB", raw)
+    extended = bool(can_id & CAN_EFF_FLAG)
+    remote = bool(can_id & CAN_RTR_FLAG)
+    error = bool(can_id & CAN_ERR_FLAG)
+    arb = can_id & (CAN_EFF_MASK if extended else CAN_SFF_MASK)
+    is_rx = echo == 0xFFFFFFFF
+    data = raw[12:12 + min(dlc, 8)]
+    return f"{ts:.6f}\t{arb:#x}\t{int(extended)}\t{int(remote)}\t{int(error)}\t{int(is_rx)}\t{echo:#x}\t{dlc}\t{channel}\t{flags:#x}\t{data.hex()}"
+
+
+def write_log(path, fclk, rows, read_errors):
+    header = "timestamp_s\tarbitration_id\tis_extended_id\tis_remote_frame\tis_error_frame\tis_rx\techo_id\tdlc\tchannel\tflags\tdata"
+    with open(OUT, "w", encoding="utf-8") as f:
+        f.write(f"# path={path}\n")
+        f.write(f"# fclk={fclk} bitrate=1000000 seconds={SECONDS} frames={len(rows)} read_errors={read_errors}\n")
+        f.write(f"# no CAN transmit\n")
+        f.write(header + "\n")
+        f.write("\n".join(rows))
+        if rows:
+            f.write("\n")
+    print(f"frames={len(rows)} read_errors={read_errors} log={OUT}")
+
+
+def listen_libusb():
+    """macOS and Linux: same capture through pyusb."""
+    from piper_client import USB_PRODUCT_ID, USB_VENDOR_ID, open_transport
+
+    transport = open_transport()
+    try:
+        t0 = time.perf_counter()
+        rows = []
+        while time.perf_counter() - t0 < SECONDS:
+            raw = transport.read(wait_ms=200)
+            if raw is None:
+                continue
+            rows.append(format_row(time.perf_counter() - t0, raw))
+        write_log(f"libusb {USB_VENDOR_ID:04x}:{USB_PRODUCT_ID:04x}", transport.clock, rows, {})
+    finally:
+        transport.close()
+
+
 def main():
+    if sys.platform != "win32":
+        listen_libusb()
+        return
     path = device_path()
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     winusb = ctypes.WinDLL("winusb", use_last_error=True)
@@ -189,34 +237,12 @@ def main():
                     read_errors[err] = read_errors.get(err, 0) + 1
                     continue
             raw = bytes(buf.raw[: transferred.value])
-            ts = time.perf_counter() - t0
-            if len(raw) < 20:
-                rows.append(f"{ts:.6f}\tSHORT\t{raw.hex()}")
-                continue
-            echo, can_id, dlc, channel, flags, _reserved = struct.unpack_from("<IIBBBB", raw)
-            extended = bool(can_id & CAN_EFF_FLAG)
-            remote = bool(can_id & CAN_RTR_FLAG)
-            error = bool(can_id & CAN_ERR_FLAG)
-            arb = can_id & (CAN_EFF_MASK if extended else CAN_SFF_MASK)
-            is_rx = echo == 0xFFFFFFFF
-            data = raw[12:12 + min(dlc, 8)]
-            rows.append(
-                f"{ts:.6f}\t{arb:#x}\t{int(extended)}\t{int(remote)}\t{int(error)}\t{int(is_rx)}\t{echo:#x}\t{dlc}\t{channel}\t{flags:#x}\t{data.hex()}"
-            )
+            rows.append(format_row(time.perf_counter() - t0, raw))
         try:
             ctrl(0x41, 2, struct.pack("<II", 0, 0))
         except OSError as exc:
             print(exc)
-        header = "timestamp_s\tarbitration_id\tis_extended_id\tis_remote_frame\tis_error_frame\tis_rx\techo_id\tdlc\tchannel\tflags\tdata"
-        with open(OUT, "w", encoding="utf-8") as f:
-            f.write(f"# path={path}\n")
-            f.write(f"# fclk={fclk} bitrate=1000000 seconds={SECONDS} frames={len(rows)} read_errors={read_errors}\n")
-            f.write(f"# no CAN transmit\n")
-            f.write(header + "\n")
-            f.write("\n".join(rows))
-            if rows:
-                f.write("\n")
-        print(f"frames={len(rows)} read_errors={read_errors} log={OUT}")
+        write_log(path, fclk, rows, read_errors)
     finally:
         winusb.WinUsb_Free(wh)
         kernel.CloseHandle(dev)

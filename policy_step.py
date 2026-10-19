@@ -12,9 +12,16 @@ import numpy as np
 
 from piper_client import PiperClient, format_state
 from policy_link import infer_once
+from team_config import load as load_config
 
 STEP_SECONDS = 0.05
 POSE_SPEED = 50
+DEFAULT_MAX_CHUNK_SHIFT_MM = 30.0
+DEFAULT_JOINT_SPEED = 60
+DEFAULT_JOINT_UPDATE_HZ = 100.0
+# 0.05 s per step, so 3 degrees per step caps joint speed near 60 deg/s.
+MAX_JOINT_STEP_DEG = 3.0
+DEFAULT_MAX_CHUNK_JOINT_DEG = 100.0
 
 
 def _rx(deg):
@@ -103,6 +110,33 @@ def action_waypoints(actions, pose):
     return waypoints, float(np.linalg.norm(position - start)), float(euler_error)
 
 
+def check_limits(waypoints, pose, config):
+    """Raise before any frame is sent if a waypoint leaves the allowed region.
+
+    max_chunk_shift_mm bounds every waypoint's distance from the pose read before
+    the chunk. workspace_mm is an absolute base-frame box {"x": [min, max], ...};
+    leave it empty to skip the box until it has been measured on site.
+    """
+    limit = float(config.get("max_chunk_shift_mm") or DEFAULT_MAX_CHUNK_SHIFT_MM)
+    start = np.array([pose["x"], pose["y"], pose["z"]], dtype=float)
+    reach = max(
+        float(np.linalg.norm(np.array([w["x"], w["y"], w["z"]]) - start)) for w in waypoints
+    )
+    if reach > limit:
+        raise RuntimeError(f"chunk reaches {reach:.1f} mm from the start pose; max_chunk_shift_mm={limit:.1f}. Nothing sent")
+    box = config.get("workspace_mm") or {}
+    for index, waypoint in enumerate(waypoints):
+        for axis, bounds in box.items():
+            if not bounds:
+                continue
+            low, high = bounds
+            if not low <= waypoint[axis] <= high:
+                raise RuntimeError(
+                    f"step {index} {axis}={waypoint[axis]:.1f} mm is outside workspace_mm {axis}=[{low}, {high}]. Nothing sent"
+                )
+    return reach
+
+
 def apply_actions(actions):
     """Enable the arm and play every step in the returned chunk."""
     actions = np.asarray(actions)
@@ -113,9 +147,10 @@ def apply_actions(actions):
         waypoints, shift_mm, euler_error = action_waypoints(actions, before["pose_mm_deg"])
         if not waypoints:
             raise RuntimeError("policy returned no actions")
+        reach_mm = check_limits(waypoints, before["pose_mm_deg"], load_config())
         final = waypoints[-1]
         print(
-            f"command_steps={len(waypoints)} shift_mm={shift_mm:.2f} "
+            f"command_steps={len(waypoints)} shift_mm={shift_mm:.2f} reach_mm={reach_mm:.2f} "
             f"euler_roundtrip_deg={euler_error:.3f} gripper_close={final['gripper_close']}",
             flush=True,
         )
@@ -152,9 +187,82 @@ def apply_actions(actions):
     print(format_state(after))
 
 
+def check_joint_chunk(actions, start, config):
+    """Raise before any frame is sent if a joint chunk jumps, or travels too far from the start."""
+    if actions.ndim != 2 or actions.shape[1] < 7 or not len(actions):
+        raise RuntimeError(f"joint actions must be (N, 7): six angles in degrees and a gripper value, got {actions.shape}")
+    limit = float(config.get("max_chunk_joint_deg") or DEFAULT_MAX_CHUNK_JOINT_DEG)
+    previous = np.asarray(start, dtype=float)
+    for index, step in enumerate(actions[:, :6]):
+        jump = float(np.max(np.abs(step - previous)))
+        if jump > MAX_JOINT_STEP_DEG:
+            raise RuntimeError(f"step {index} moves a joint {jump:.1f} deg in one step (max {MAX_JOINT_STEP_DEG}). Nothing sent")
+        previous = step
+    reach = float(np.max(np.abs(actions[:, :6] - np.asarray(start, dtype=float))))
+    if reach > limit:
+        raise RuntimeError(f"chunk moves a joint {reach:.1f} deg from the start; max_chunk_joint_deg={limit:.1f}. Nothing sent")
+    return reach
+
+
+def apply_joint_actions(actions, speed=None, update_hz=None):
+    """Play a chunk of absolute joint targets: columns 0-5 degrees, column 6 gripper (>= 0.5 closes).
+
+    speed (percent) falls back to joint_speed in team_config.json, then 60.
+    update_hz is how often the target changes within a step; 20 holds one
+    target per 0.05 s step.
+    """
+    actions = np.asarray(actions, dtype=float)
+    with PiperClient() as robot:
+        before = robot.read_state()
+        if not before["complete"]:
+            raise RuntimeError("arm feedback is incomplete")
+        config = load_config()
+        reach = check_joint_chunk(actions, before["joints_deg"], config)
+        speed = int(speed or config.get("joint_speed") or DEFAULT_JOINT_SPEED)
+        update_hz = float(update_hz or DEFAULT_JOINT_UPDATE_HZ)
+        final = actions[-1]
+        print(
+            f"command_steps={len(actions)} joint_reach_deg={reach:.1f} speed={speed} freq={update_hz:g} "
+            "target_joints_deg=" + ", ".join(f"J{i + 1}:{v:.1f}" for i, v in enumerate(final[:6])),
+            flush=True,
+        )
+        maximum = robot.gripper_max_mm()
+        robot.exit_drag_teach()
+        robot.enable_arm()
+        previous = before["joints_deg"]
+        for step in actions:
+            robot.move_joints(
+                step[:6],
+                duration=STEP_SECONDS,
+                speed=speed,
+                gripper_mm=0.0 if step[6] >= 0.5 else maximum,
+                start_deg=previous,
+                update_hz=update_hz,
+            )
+            previous = step[:6]
+        print("joints_sent", flush=True)
+        # Hold the last target briefly so the arm settles before the state is read.
+        robot.move_joints(final[:6], duration=0.5, speed=speed, gripper_mm=0.0 if final[6] >= 0.5 else maximum)
+        after = robot.read_state()
+    print("after")
+    print(format_state(after))
+
+
 def main():
     if len(sys.argv) > 2 and sys.argv[1] == "apply":
-        apply_actions(np.load(sys.argv[2]))
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        parser.add_argument("command")
+        parser.add_argument("path")
+        parser.add_argument("action_space", nargs="?", default="ee_delta", choices=("ee_delta", "joints"))
+        parser.add_argument("--speed", type=int)
+        parser.add_argument("--freq", type=float)
+        args = parser.parse_args()
+        if args.action_space == "joints":
+            apply_joint_actions(np.load(args.path), speed=args.speed, update_hz=args.freq)
+        else:
+            apply_actions(np.load(args.path))
         return
     infer_once("127.0.0.1", 8000)
 
