@@ -5,12 +5,14 @@ msgpack metadata first, then each client message is one msgpack observation
 and each reply is one msgpack dict. NumPy arrays use the same ``__ndarray__``
 encoding as ``openpi_client.msgpack_numpy``.
 
-The single RealSense color frame fills every image field. Each reply is one
+The single Astra Pro color frame fills every image field. Each reply is one
 action chunk. The client plays that chunk, then sends a new observation.
 Ctrl+C stops the loop. Operators use USER_GUIDE.md; protocol and code notes are in DEVELOPER_GUIDE.md.
 """
 
 import argparse
+import ctypes
+from ctypes import POINTER, Structure, byref, c_void_p
 import time
 
 import msgpack
@@ -23,6 +25,7 @@ from piper_client import PiperClient, format_state
 HOST = "127.0.0.1"
 PORT = 8765
 IMAGE_SHAPE = (224, 224, 3)
+COLOR_CAMERA_ID = "vid_2bc5&pid_0501"
 
 
 def pack_array(obj):
@@ -73,26 +76,122 @@ def resize_with_pad(image, height, width):
     return canvas
 
 
-def capture_realsense_color():
-    """Return one RGB frame from the connected RealSense, padded to 224x224."""
-    import pyrealsense2 as rs
+def _directshow_names():
+    """Return DirectShow video-device display names in OpenCV's index order."""
+    ole32 = ctypes.windll.ole32
+    ole32.CoInitialize(None)
 
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    pipeline.start(config)
+    class GUID(Structure):
+        _fields_ = [
+            ("Data1", ctypes.c_ulong),
+            ("Data2", ctypes.c_ushort),
+            ("Data3", ctypes.c_ushort),
+            ("Data4", ctypes.c_ubyte * 8),
+        ]
+
+    def guid(text):
+        value = GUID()
+        if ole32.CLSIDFromString(text, byref(value)) != 0:
+            raise RuntimeError(text)
+        return value
+
+    def com_method(pointer, slot, prototype):
+        vtable = ctypes.cast(pointer, POINTER(c_void_p))[0]
+        return prototype(ctypes.cast(vtable, POINTER(c_void_p))[slot])
+
+    def release(pointer):
+        if pointer:
+            com_method(pointer, 2, ctypes.WINFUNCTYPE(ctypes.c_ulong, c_void_p))(pointer)
+
+    system_enum = guid("{62BE5D10-60EB-11d0-BD3B-00A0C911CE86}")
+    video_category = guid("{860BB310-5D01-11d0-BD3B-00A0C911CE86}")
+    create_enum_iid = guid("{29840822-5B84-11D0-BD3B-00A0C911CE86}")
+    enumerator = c_void_p()
+    hr = ole32.CoCreateInstance(byref(system_enum), None, 1, byref(create_enum_iid), byref(enumerator))
+    if hr != 0:
+        raise OSError(f"camera enumeration failed hr={hr:#x}")
+    create = com_method(
+        enumerator,
+        3,
+        ctypes.WINFUNCTYPE(ctypes.c_long, c_void_p, POINTER(GUID), POINTER(c_void_p), ctypes.c_ulong),
+    )
+    devices = c_void_p()
+    hr = create(enumerator, byref(video_category), byref(devices), 0)
+    if hr != 0:
+        release(enumerator)
+        raise OSError(f"camera enumeration failed hr={hr:#x}")
+    next_device = com_method(
+        devices,
+        3,
+        ctypes.WINFUNCTYPE(ctypes.c_long, c_void_p, ctypes.c_ulong, POINTER(c_void_p), POINTER(ctypes.c_ulong)),
+    )
+    bind_ctx = c_void_p()
+    ole32.CreateBindCtx.argtypes = [ctypes.c_ulong, POINTER(c_void_p)]
+    ole32.CreateBindCtx.restype = ctypes.c_long
+    if ole32.CreateBindCtx(0, byref(bind_ctx)) != 0:
+        release(devices)
+        release(enumerator)
+        raise OSError("camera enumeration failed while creating a bind context")
+    names = []
+    while True:
+        moniker = c_void_p()
+        fetched = ctypes.c_ulong()
+        hr = next_device(devices, 1, byref(moniker), byref(fetched))
+        if hr != 0 or not fetched.value:
+            break
+        display = c_void_p()
+        get_name = com_method(
+            moniker,
+            20,
+            ctypes.WINFUNCTYPE(ctypes.c_long, c_void_p, c_void_p, c_void_p, POINTER(c_void_p)),
+        )
+        text = ""
+        if get_name(moniker, bind_ctx, None, byref(display)) == 0 and display.value:
+            text = ctypes.wstring_at(display.value)
+            ole32.CoTaskMemFree(display)
+        names.append(text)
+        release(moniker)
+    release(bind_ctx)
+    release(devices)
+    release(enumerator)
+    return names
+
+
+def color_camera_index():
+    """Index of the Astra Pro color camera. The IR and laptop cameras are skipped."""
+    names = _directshow_names()
+    for index, name in enumerate(names):
+        if COLOR_CAMERA_ID in name.lower():
+            return index
+    raise RuntimeError("Astra Pro color camera was not found (USB VID_2BC5 PID_0501)")
+
+
+def capture_color_bgr():
+    """Return one BGR frame from the Astra Pro color camera."""
+    import cv2
+
+    index = color_camera_index()
+    capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+    if not capture.isOpened():
+        raise RuntimeError(f"could not open Astra Pro color camera at index {index}")
     try:
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         frame = None
-        for _ in range(20):
-            frames = pipeline.wait_for_frames(5000)
-            color = frames.get_color_frame()
-            if color:
-                frame = np.asanyarray(color.get_data())
+        for _ in range(15):
+            ok, frame = capture.read()
+            if not ok:
+                frame = None
         if frame is None:
-            raise RuntimeError("RealSense returned no color frame")
+            raise RuntimeError("Astra Pro returned no color frame")
+        return frame
     finally:
-        pipeline.stop()
-    rgb = np.ascontiguousarray(frame[:, :, ::-1])
+        capture.release()
+
+
+def capture_color():
+    """Return one RGB frame from the Astra Pro, padded to 224x224."""
+    rgb = np.ascontiguousarray(capture_color_bgr()[:, :, ::-1])
     return resize_with_pad(rgb, IMAGE_SHAPE[0], IMAGE_SHAPE[1])
 
 
@@ -200,7 +299,7 @@ def serve(host, port):
 
 
 def _apply_in_subprocess(actions):
-    """Run the CAN command in a fresh process. RealSense and WinUSB crash if combined."""
+    """Run the CAN command in a fresh process. The camera and WinUSB crash if combined."""
     import subprocess
     import sys
     import tempfile
@@ -248,7 +347,7 @@ def infer_once(host, port):
                     state = robot.read_state()
                 if not state["complete"]:
                     raise RuntimeError("arm feedback is incomplete")
-                image = capture_realsense_color()
+                image = capture_color()
                 observation = build_observation(state, image)
                 print(f"image_mean={float(image.mean()):.1f}", flush=True)
                 print(format_state(state), flush=True)

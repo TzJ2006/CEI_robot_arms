@@ -2,12 +2,12 @@
 
 This guide is for people operating the arm. To change code, observation fields, or the CAN protocol, read `DEVELOPER_GUIDE.md`. The Chinese version is `用户文档.md`.
 
-What this does: the Windows computer reads the arm, captures one RealSense D405 color frame, copies that same frame into the three image fields, and sends the observation through the local SSH tunnel. Each reply is a 50-step end-effector chunk. The computer plays the whole chunk in the arm base frame, then reads a new state and image and requests the next chunk, until you press `Ctrl+C`. Account, code directory, server name, and model name belong in `team_config.json`. This guide does not hard-code them.
+What this does: the Windows computer reads the arm, captures one Orbbec Astra Pro color frame, copies that same frame into the three image fields, and sends the observation through the local SSH tunnel. Each reply is a 50-step end-effector chunk. The computer plays the whole chunk in the arm base frame, then reads a new state and image and requests the next chunk, until you press `Ctrl+C`. Account, code directory, server name, and model name belong in `team_config.json`. This guide does not hard-code them.
 
 ```mermaid
 flowchart LR
   arm[Piper]
-  cam[RealSense D405]
+  cam[Orbbec Astra Pro]
   win[Windows computer]
   login[Login node]
   gpu[Model on a compute node]
@@ -68,7 +68,7 @@ python team_config.py run
 2. Submit a job named `serve-policy` when you do not already have one, and reuse it when you do. `--port` is placed before `policy:checkpoint`.
 3. Check the job about every 10 seconds. After the log says the server is listening, read the compute-node address. Warnings from a simulator while the model loads can be ignored for now. Do not SSH into the compute node; SSH can hang while the node is busy.
 4. Open a window titled `piper-link` for the local forward. Type the SSH password once more in that window, then leave it open.
-5. Read the arm and the RealSense, send an observation, execute the whole returned chunk, then start the next chunk. The port is `local_forward_port`. The arm moves. Press `Ctrl+C` to stop the loop.
+5. Read the arm and the Astra Pro, send an observation, execute the whole returned chunk, then start the next chunk. The port is `local_forward_port`. The arm moves. Press `Ctrl+C` to stop the loop.
 
 While the server and the forward window are still up, start another continuous run without submitting again:
 
@@ -106,7 +106,7 @@ A chunk that reached its target shows `CAN_CTRL` and `motion=0`. The pose under 
 | `gripper_mm` | Gripper opening, in millimeters |
 | `pose_mm_deg` | End-effector position in millimeters and orientation in degrees |
 | `complete=True` | Joints, gripper, pose, and status were all received |
-| `image_mean` | Average brightness of the RealSense D405 color frame after padding to 224×224. Only one camera is connected, so that same frame fills the external, wrist, and right image fields |
+| `image_mean` | Average brightness of the Orbbec Astra Pro color frame after padding to 224×224. Only one camera is connected, so that same frame fills the external, wrist, and right image fields |
 | `cycle` | Which chunk this is. Each chunk captures a new frame and requests a new inference |
 | `command_steps` | How many steps of this chunk were sent. The current code sends every step the model returned |
 | `shift_mm` | Total end-effector translation of this chunk, in millimeters |

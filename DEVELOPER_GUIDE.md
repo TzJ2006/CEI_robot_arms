@@ -83,7 +83,7 @@ One full gripper stroke has been verified, with the joint angles unchanged befor
 
 While `0x2A1` control mode is `0x02` (`TEACHING`) and the teach byte is `0x01`, end-pose commands are not followed. After leaving teach mode, one verified motion ended in `CAN_CTRL` with `motion=0`, and the pose read back was close to the commanded target. Bit 6 of byte 6 in low-speed feedback `0x261`–`0x266` means that joint driver is enabled.
 
-Reads and writes use separate events. Each write waits for completion and drains the transmit echo; otherwise later writes stall. Close cancels pending I/O and releases the interface. It does not send the bus-stop control transfer, which hung the process. Putting RealSense and CAN writes in one process exits with an access violation (`3221225477`), so `policy_link.py` hands the action array to a new `policy_step.py` process.
+Reads and writes use separate events. Each write waits for completion and drains the transmit echo; otherwise later writes stall. Close cancels pending I/O and releases the interface. It does not send the bus-stop control transfer, which hung the process. Putting the camera and CAN writes in one process exits with an access violation (`3221225477`), so `policy_link.py` hands the action array to a new `policy_step.py` process.
 
 ## Policy link
 
@@ -96,7 +96,7 @@ Order inside `once`:
 1. Retry the connection to `ws://host:port` up to 50 times, with a 2-second handshake timeout. `python team_config.py once` and `python policy_link.py once` without `--port` both use `local_forward_port`. `python policy_link.py serve` still listens on `127.0.0.1:8765` by default, which is the local placeholder server.
 2. Receive metadata within 30 seconds and print `server_connected`.
 3. Call `read_state()`. If it is incomplete, raise and do not send.
-4. `capture_realsense_color()` takes one RGB frame from the RealSense D405 and pads it to 224×224. `build_observation(state, image)` copies that same frame into all three image fields.
+4. `capture_color()` takes one RGB frame from the Orbbec Astra Pro color camera (USB `VID_2BC5` `PID_0501`) and pads it to 224×224. Other cameras on the same computer are not selected. `build_observation(state, image)` copies that same frame into all three image fields.
 5. Send the observation and print `image_mean` and `waiting_for_inference`.
 6. Wait up to 600 seconds. If the reply is a string, raise it as a `RuntimeError`. That is how an OpenPI server returns an exception.
 7. Print `actions_shape`. One verified return was `(50, 12)`. Then execute the whole chunk in a separate process, and print `pose_sent` plus the state read afterward.
@@ -112,7 +112,7 @@ The table below is what the current function sends. It is not everyone's input:
 
 | Key | Value |
 | --- | --- |
-| `observation/image` | uint8, `(224, 224, 3)`, RealSense D405 color frame |
+| `observation/image` | uint8, `(224, 224, 3)`, Orbbec Astra Pro color frame |
 | `observation/wrist_image` | a copy of that same frame. There is no second camera |
 | `observation/right_image` | a copy of that same frame. Some models do not need a third image; a missing key is reported by the server |
 | `observation/state` | float32, shape `(16,)` |
@@ -128,7 +128,7 @@ The order of these 16 numbers is hard-coded in `robocasa_state()`. If another mo
 | 10–13 | base quaternion, wxyz | `1 0 0 0` |
 | 14–15 | two finger joint positions, meters | opening in millimeters divided by 2000, written into both fingers |
 
-Do not change the msgpack packing. With only one D405, say that all three fields contain the same frame. The 16-value order has not been checked item by item against the training-state concatenation. Run the candidate-repository check before changing models. This control loop does not use a camera extrinsic, and no hand-eye calibration was done.
+Do not change the msgpack packing. With only one Astra Pro, say that all three fields contain the same frame. The 16-value order has not been checked item by item against the training-state concatenation. Run the candidate-repository check before changing models. This control loop does not use a camera extrinsic, and no hand-eye calibration was done.
 
 ## Action contract
 
@@ -224,4 +224,4 @@ If the action type, units, or camera fields are still uncertain, do not write an
 
 Verified on one Piper with a candleLight adapter: a passive capture collected `0x2A1`–`0x2A8`, a full gripper stroke left the joints unchanged, the WebSocket delivered an observation and received `(50, 12)`, and one end-effector chunk was followed after teach mode was left.
 
-One RealSense D405 is connected. Its color frame is in the observation and is copied into all three image fields. Continuous control is the outer loop: play the whole chunk, observe again, then infer again. Not done: separate wrist and right cameras, hand-eye calibration, an item-by-item check of the 16-value state against the training concatenation, joint-space `0x155` commands, and master/slave offsets. This loop does not consume a camera extrinsic. When a model uses a different action meaning, change `action_waypoints()` first.
+One Orbbec Astra Pro color camera is connected. Its color frame is in the observation and is copied into all three image fields. Continuous control is the outer loop: play the whole chunk, observe again, then infer again. Not done: separate wrist and right cameras, hand-eye calibration, an item-by-item check of the 16-value state against the training concatenation, joint-space `0x155` commands, and master/slave offsets. This loop does not consume a camera extrinsic. When a model uses a different action meaning, change `action_waypoints()` first.
