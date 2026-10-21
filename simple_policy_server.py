@@ -99,8 +99,8 @@ def demo_chunk(cycle, joints):
 
 # Same step length as policy_step.STEP_SECONDS; this file runs on the server without policy_step.
 STEP_SECONDS = 0.05
-# Gripper openings below this count as closed (column 6 = 1.0); same as dataset_export.GRIPPER_CLOSE_MM.
-CLOSE_BELOW_MM = 5.0
+# Gripper openings at or below this count as closed. Same value as dataset_export.GRIPPER_CLOSE_MM.
+CLOSE_BELOW_MM = 28.0
 
 
 def episode_arrays(path):

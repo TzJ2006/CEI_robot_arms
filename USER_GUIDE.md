@@ -97,11 +97,11 @@ When the attempt is over, press one key in the same window (no Enter needed):
 
 | Key | Result |
 | --- | --- |
-| `s` | Success, then the same command checks and exports it |
+| `s` | Success. The episode is checked, exported, and every successful episode is packed into `datasets/piper_finetune` |
 | `f` | Failure, kept but not exported |
 | `d` | Discard |
 
-The folder name is filled in by the program. Do not copy it into another command. `teaching_fraction` should be close to 1 and `frames_missing` should be 0. After `s`, the result is in the `export` folder printed at the end. Flagged steps are not used for training. The rules are in `数据采集.md`.
+The folder name is filled in by the program. Do not copy it into another command. `teaching_fraction` should be close to 1 and `frames_missing` should be 0. After `s`, that episode's `export` folder is printed, and the fine-tune pack is `datasets/piper_finetune`. Flagged steps stay out of the pack. How to load it on the training machine is in `SERVER_TRAINING.md`. The collection rules are in `数据采集.md`.
 
 To check and export the newest episode already on disk:
 

@@ -1,11 +1,12 @@
-"""Record, check, and export one drag-teach episode without copying its folder name.
+"""Record, check, export, and pack one drag-teach episode.
 
 Turn on drag-teach first, then run this in this folder:
 
     python collect.py --task "put the pen in the box"
 
 Press s, f, or d in the same window when the attempt ends. Only s is exported.
-To check and export the newest episode already on disk:
+A successful export also rebuilds datasets/piper_finetune from every successful
+episode in this folder. To do that for the newest episode already on disk:
 
     python collect.py --latest
 """
@@ -23,9 +24,10 @@ def newest_episode(out_dir):
     return max(candidates, key=lambda path: path.name)
 
 
-def finish_episode(episode):
+def finish_episode(episode, episodes_root):
     from dataset_export import export_episode
     from episode_check import check_episode
+    from prepare_dataset import build_dataset
 
     episode = Path(episode)
     check_episode(episode)
@@ -34,6 +36,7 @@ def finish_episode(episode):
         print(f"not exported success={metadata.get('success')} episode={episode}", flush=True)
         return
     export_episode(episode)
+    build_dataset(episodes_root)
 
 
 def main():
@@ -48,11 +51,11 @@ def main():
     if not args.task and not args.latest:
         raise SystemExit("pass --task to record one episode, or --latest to check and export the newest one")
     if args.latest:
-        finish_episode(newest_episode(args.out))
+        finish_episode(newest_episode(args.out), args.out)
         return
     from episode_recorder import record_episode
 
-    finish_episode(record_episode(args.task, args.out, args.seconds))
+    finish_episode(record_episode(args.task, args.out, args.seconds), args.out)
 
 
 if __name__ == "__main__":
