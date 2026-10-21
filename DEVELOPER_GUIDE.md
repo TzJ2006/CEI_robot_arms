@@ -50,6 +50,7 @@ flowchart TB
 | `用户文档.md` | Operating steps in Chinese |
 | `_can_listen.py` | Capture that receives only and transmits nothing. The log is `_can_listen_log.txt` in this directory |
 | `check_candidate_repo.py` | After a candidate policy repository arrives, search its config, actions, normalization, cameras, and any Piper execution code |
+| `prepare_dataset.py` | Pack successful demonstrations into `datasets/piper_finetune`. Server changes are in `SERVER_TRAINING.md` |
 
 Paths are relative to the directory that contains this code. Do not put someone's desktop absolute path into the docs or into new code. Server paths come from `team_config.json`.
 
@@ -179,7 +180,7 @@ In low-speed feedback `0x261`–`0x266`, the driver-enabled flag is bit 6 of byt
 
 Replay uses the drag-teach episodes from `episode_recorder.py` (see `数据采集.md`). `episode_arrays()` reads `j1_deg`–`j6_deg`, `gripper_mm`, and `t_robot` from `robot_feedback.parquet`, or the same arrays from an `.npz`. `setup-remote` writes that `.npz` with `write_replay_npz()` and uploads it as `episodes/<episode folder>.npz`, so the server venv needs no pandas. The recorder runs on Windows and macOS: `open_policy_camera()` picks the Astra Pro with DirectShow or AVFoundation, and `KeyReader` reads `s`/`f`/`d` through `msvcrt` or a cbreak terminal (restored on exit; macOS then sets `PENDIN`, which is harmless).
 
-`simple_policy_server.py --mode replay --episode FILE` resamples onto 0.05 s steps with `np.interp`, marks the gripper closed below 5 mm (`dataset_export.GRIPPER_CLOSE_MM`), and splits any step above 2.4 degrees. Each reply is the next `--chunk` steps (default 50). When the arm is more than 2.4 degrees from the chunk's first row (first chunk, loop restart, or lag), a half-speed `keyframe_chunk()` bridge is prepended. At the end the reply is `{"actions": (0, 7), "done": True}` and `policy_link.py` prints `server_done` and returns; `--loop` restarts instead. Each connection replays from the start.
+`simple_policy_server.py --mode replay --episode FILE` resamples onto 0.05 s steps with `np.interp`, marks the gripper closed at or below `dataset_export.GRIPPER_CLOSE_MM` (28 mm), and splits any step above 2.4 degrees. Each reply is the next `--chunk` steps (default 50). When the arm is more than 2.4 degrees from the chunk's first row (first chunk, loop restart, or lag), a half-speed `keyframe_chunk()` bridge is prepended. At the end the reply is `{"actions": (0, 7), "done": True}` and `policy_link.py` prints `server_done` and returns; `--loop` restarts instead. Each connection replays from the start.
 
 `team_config.py` takes `--server simple|replay|openpi` over `server_mode`, then applies `mode_overrides[mode]` (any keys, typically Slurm partition, memory, time). `replay` copies `replay_episode` to `remote_code_dir/episodes/` in `setup-remote`. `openpi` runs `openpi_python` (default `.venv/bin/python` in `openpi_dir`) on a GPU; `openpi_dir`, `openpi_python`, and `checkpoint_dir` may start with `~/`. The job carries `--comment=MODE`; `up` refuses to reuse a `serve-policy` job from another mode. When the job's address differs from the one saved in `piper_link_state.json`, `up` closes the old local forward and opens a new one.
 

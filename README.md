@@ -4,7 +4,7 @@ A Windows or Mac computer reads an AgileX Piper and one Orbbec Astra Pro color c
 
 本机可以是 Windows 或 Mac。它经 candleLight 读取 AgileX Piper，用 Orbbec Astra Pro 拍一张彩色图，把同一帧填进三个图像字段，经 SSH 隧道发给计算节点上的策略服务。服务每次返回一段末端增量。本机按底座坐标执行，然后重新观测，直到按 `Ctrl+C`。Mac 上用仓库里的 `.venv/bin/python`，并先按开发文档安装 libusb。
 
-操作步骤看 [`用户文档.md`](用户文档.md)，英文版是 [`USER_GUIDE.md`](USER_GUIDE.md)。改观测、动作映射或 CAN 协议时看 [`开发文档.md`](开发文档.md)，英文版是 [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md)。训练数据采集的规定看 [`数据采集.md`](数据采集.md)。
+操作步骤看 [`用户文档.md`](用户文档.md)，英文版是 [`USER_GUIDE.md`](USER_GUIDE.md)。改观测、动作映射或 CAN 协议时看 [`开发文档.md`](开发文档.md)，英文版是 [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md)。训练数据采集的规定看 [`数据采集.md`](数据采集.md)。服务器上怎么加载微调数据看 [`服务器训练对接.md`](服务器训练对接.md)，英文版是 [`SERVER_TRAINING.md`](SERVER_TRAINING.md)。
 
 ```mermaid
 flowchart LR
@@ -38,7 +38,7 @@ Stop the job and the forward with `python team_config.py down`. Check the arm wi
 
 On Windows, close ArmRobot before any of these commands. Leave drag-teach before `run` or `once`. While status stays `TEACHING` with `teach=1`, pose commands are ignored. Edit the `prompt` string in `policy_link.py` before a run. Do not run `python piper_client.py`; that command opens and closes the gripper.
 
-To record a drag-teach episode, turn drag-teach on first, then run `python collect.py --task "put the pen in the box"`. A window shows the camera. Press `s` when the attempt succeeds. See `用户文档.md`.
+To record a drag-teach episode, turn drag-teach on first, then run `python collect.py --task "put the pen in the box"`. A window shows the camera. Press `s` when the attempt succeeds. That also rebuilds `datasets/piper_finetune`. See `用户文档.md`.
 
 Python packages used here are `numpy`, `opencv-python`, `msgpack`, and `websockets`. Recording also needs `pandas` and `pyarrow`. Mac also needs `pyusb`, `pyobjc-framework-AVFoundation`, and `brew install libusb`. The CAN client does not import `piper_sdk`: Windows uses WinUSB, and Mac uses libusb.
 
@@ -54,9 +54,10 @@ Python packages used here are `numpy`, `opencv-python`, `msgpack`, and `websocke
 | `piper_client.py` | candleLight client: WinUSB on Windows, libusb on Mac |
 | `check_candidate_repo.py` | Search a candidate policy repo before changing the action mapping |
 | `_can_listen.py` | Receive-only CAN capture |
-| `collect.py` | One command for a training episode: record, check, and export after `s`. `--latest` does the last two for the newest episode |
+| `collect.py` | Record, check, export, and rebuild `datasets/piper_finetune` after `s`. `--latest` does that for the newest episode |
 | `episode_recorder.py` | Read-only drag-teach episode: arm feedback, one Astra frame, start and success or failure |
 | `episode_check.py` | Print the episode timeline and save pose curves beside frames |
-| `dataset_export.py` | Resample a successful drag episode to 0.05 s. Intervals that are not teach mode, lack a fresh image, or jump are masked out of training |
+| `dataset_export.py` | Resample a successful drag episode to 0.05 s. Intervals that are not teach mode, lack a fresh image, or jump are masked |
+| `prepare_dataset.py` | Pack every successful export into `datasets/piper_finetune` for the server fine-tune |
 
 The current 12-d mapping is for one end-effector delta policy: translation, rotation, and gripper in the arm base frame. Base, torso, and mode values are dropped. A different checkpoint needs a new `action_waypoints()`.

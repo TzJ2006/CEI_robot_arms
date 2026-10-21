@@ -26,6 +26,8 @@ python simple_policy_server.py --port 8000 [--mode demo|nudge|replay --episode F
 python episode_recorder.py --task "..."  # 拖动示教只读录制（相机+反馈），s/f/d 结束；Win/Mac 通用
 python episode_check.py episodes/episode_...   # 时间线和曲线检查
 python dataset_export.py episodes/episode_...  # 成功的 episode 导出 0.05 s 网格的 12 维动作和 mask；--self-check 不连臂
+python prepare_dataset.py          # 把所有成功 episode 整理成 datasets/piper_finetune；--self-check 不连臂
+python collect.py --task "..."     # 录一条，s 之后检查、导出并重建微调数据集
 python team_config.py run --server replay|openpi [--ready]  # 覆盖 server_mode；--ready 先展开到 READY_DEG
 python policy_link.py ready     # 只把臂展开到准备姿态（会动臂）
 python policy_link.py home      # 收回到休息位，全关节 0（会动臂）
