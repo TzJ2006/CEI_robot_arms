@@ -36,9 +36,9 @@ python team_config.py once
 
 Stop the job and the forward with `python team_config.py down`. Check the arm without moving it with `python team_config.py arm`. Save one camera frame with `python _realsense_test.py`; the picture is `_camera_test\astra_color.png`.
 
-Close ArmRobot before any of these commands. Leave drag-teach before `run` or `once`. While status stays `TEACHING` with `teach=1`, pose commands are ignored. Edit the `prompt` string in `policy_link.py` before a run. Do not run `python piper_client.py`; that command opens and closes the gripper.
+Close ArmRobot before any of these commands. Leave drag-teach before `run` or `once`. While status stays `TEACHING` with `teach=1`, pose commands are ignored. Edit the `prompt` string in `policy_link.py` before a run.
 
-Python packages used here are `numpy`, `opencv-python`, `msgpack`, and `websockets`. The CAN client uses the Windows WinUSB API and does not import `piper_sdk`.
+Python packages used here are `numpy`, `opencv-python`, `msgpack`, `websockets`, `python-can`, and AgileX's `pyAgxArm` (`pip install "git+https://github.com/agilexrobotics/pyAgxArm.git"`). All CAN traffic goes through `pyAgxArm`; `piper_can_bus.py` lets it use the candleLight over USB on Windows and macOS.
 
 ## Files
 
@@ -48,7 +48,8 @@ Python packages used here are `numpy`, `opencv-python`, `msgpack`, and `websocke
 | `team_config.py` | `run`, `once`, `down`, and `arm` |
 | `policy_link.py` | Observation, WebSocket loop, and Astra Pro capture (`VID_2BC5` `PID_0501`) |
 | `policy_step.py` | Turns one 12-d chunk into base-frame pose commands |
-| `piper_client.py` | candleLight WinUSB client |
+| `piper_client.py` | Arm client on the official `pyAgxArm` SDK |
+| `piper_can_bus.py` | CAN backend per platform for `pyAgxArm` |
 | `check_candidate_repo.py` | Search a candidate policy repo before changing the action mapping |
 | `_can_listen.py` | Receive-only CAN capture |
 | `_realsense_test.py` | Save one Astra Pro color frame |

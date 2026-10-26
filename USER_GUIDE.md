@@ -42,7 +42,7 @@ flowchart LR
 
 ## On a Mac
 
-Run the one-time setup in the developer guide (`brew install libusb` and the `.venv`), then use `.venv/bin/python` in place of `python` below. Before the first run:
+Run the one-time setup in the developer guide (`brew install libusb` and the `.venv`, which includes `python-can` and `pyAgxArm`), then use `.venv/bin/python` in place of `python` below. Before the first run:
 
 1. Allow camera access for Terminal (System Settings > Privacy & Security > Camera). The Astra Pro is found automatically; `.venv/bin/python policy_link.py preview` shows what it sees live, and q closes the window. Only if it picks the wrong camera, put the right number from `policy_link.py cameras` in `camera_index`.
 2. With `server_mode` set to `"simple"`, `.venv/bin/python team_config.py setup-remote` copies the test server to athena once. Fill `slurm_partition` first.
@@ -73,11 +73,10 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 .venv/bin/python team_config.py run --server openpi --ready
 ```
 
-`--ready` unfolds the arm to the ready pose first, because end-pose chunks from the folded pose only move the gripper. This model was trained in simulation: its full 50-step chunk integrates to 0.3–1.5 m, far more than the simulated arm moved. `execute_steps` (here 10) keeps only the first steps and `ee_delta_scale` (here 0.1) shrinks each one; with these, about 3 of 4 chunks stay within `max_chunk_shift_mm`. A chunk outside it prints `chunk_refused`, sends nothing, and the loop observes again. Expect small motions, not a finished task. Switching between `simple`, `replay`, and `openpi` needs `down` first; `run` refuses a job started in another mode. `.venv/bin/python policy_link.py ready` only unfolds the arm. `.venv/bin/python policy_link.py home` folds it back to the rest pose (all joints 0) at the same slow speed, gripper open; it needs no server. A move of more than `max_chunk_joint_deg` is refused; then move the arm closer by hand in drag-teach first.
+`--ready` unfolds the arm to the ready pose first, because end-pose chunks from the folded pose only move the gripper. This model was trained in simulation: its full 50-step chunk integrates to 0.3–1.5 m, far more than the simulated arm moved. `execute_steps` (here 10) keeps only the first steps and `ee_delta_scale` (here 0.1) shrinks each one; with these, about 3 of 4 chunks stay within `max_chunk_shift_mm`. A chunk outside it prints `chunk_refused`, sends nothing, and the loop observes again. Expect small motions, not a finished task. Switching between `simple`, `replay`, and `openpi` needs `down` first; `run` refuses a job started in another mode. `.venv/bin/python policy_link.py ready` only unfolds the arm. `.venv/bin/python policy_link.py home` folds it back to just above the rest pose (`home_deg` in `team_config.json`, default J2 10°, J3 −5°) at the same slow speed, gripper open; it needs no server. Do not set any joint of `home_deg` at its mechanical stop: that trips the joint driver, and then the arm ignores joint commands until it is power-cycled. A move of more than `max_chunk_joint_deg` is refused; then move the arm closer by hand in drag-teach first.
 
 ## Do not
 
-- Do not run `python piper_client.py`. That command opens the gripper fully and then closes it.
 - Do not run `run` or `once` while drag-teach is still on. While status stays `TEACHING` with `teach=1`, end-effector commands are ignored. Leave teach mode first so status can enter `CAN_CTRL`.
 - Leave room around the arm. Each chunk is all 50 steps returned by the model, and the travel can be more than 1 cm.
 - The language instruction is the `prompt` field in `policy_link.py`. Change that English sentence before a run. There is no separate command-line prompt.

@@ -146,6 +146,14 @@ def check_limits(waypoints, pose, config):
     return reach
 
 
+def require_healthy_drivers(robot):
+    """Raise before any motion frame when a joint driver reports a fault."""
+    faults = robot.driver_faults()
+    if faults:
+        listed = "; ".join(f"J{joint}: {', '.join(names)}" for joint, names in faults.items())
+        raise RuntimeError(f"joint driver fault ({listed}). Nothing sent. Power-cycle the arm to clear it")
+
+
 def apply_actions(actions):
     """Enable the arm and play the returned chunk.
 
@@ -178,6 +186,7 @@ def apply_actions(actions):
             f"rx:{final['rx']:.2f}, ry:{final['ry']:.2f}, rz:{final['rz']:.2f}",
             flush=True,
         )
+        require_healthy_drivers(robot)
         maximum = robot.gripper_max_mm()
         print("exit_teach", flush=True)
         robot.exit_drag_teach()
@@ -244,6 +253,7 @@ def apply_joint_actions(actions, speed=None, update_hz=None):
             "target_joints_deg=" + ", ".join(f"J{i + 1}:{v:.1f}" for i, v in enumerate(final[:6])),
             flush=True,
         )
+        require_healthy_drivers(robot)
         maximum = robot.gripper_max_mm()
         robot.exit_drag_teach()
         robot.enable_arm()

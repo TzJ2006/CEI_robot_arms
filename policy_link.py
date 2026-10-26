@@ -195,10 +195,31 @@ def _configured_camera_index():
     )
 
 
+def _v4l2_camera_index():
+    """Linux: N of the /dev/videoN whose USB IDs are 2BC5:0501 and whose V4L2 index is 0 (the capture node)."""
+    from pathlib import Path
+
+    for node in sorted(Path("/sys/class/video4linux").glob("video*"), key=lambda path: int(path.name[5:])):
+        usb = node.joinpath("device").resolve().parent
+        try:
+            ids = (usb / "idVendor").read_text().strip(), (usb / "idProduct").read_text().strip()
+            capture_node = (node / "index").read_text().strip() == "0"
+        except OSError:
+            continue
+        if ids == ("2bc5", "0501") and capture_node:
+            return int(node.name[5:])
+    raise RuntimeError("Astra Pro color camera (USB 2BC5:0501) not found under /sys/class/video4linux")
+
+
 def policy_camera_index():
-    """Astra Pro index on this platform: DirectShow by USB ID on Windows, AVFoundation (or camera_index) elsewhere."""
+    """Astra Pro index: DirectShow on Windows, V4L2 on Linux, AVFoundation on macOS; camera_index overrides off Windows."""
     if sys.platform == "win32":
         return color_camera_index()
+    if sys.platform.startswith("linux"):
+        from team_config import load
+
+        value = load().get("camera_index")
+        return int(value) if value not in ("", None) else _v4l2_camera_index()
     return _configured_camera_index()
 
 
@@ -215,6 +236,8 @@ def _open_capture(index):
         return cv2.VideoCapture(index, cv2.CAP_DSHOW)
     if sys.platform == "darwin":
         return cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
+    if sys.platform.startswith("linux"):
+        return cv2.VideoCapture(index, cv2.CAP_V4L2)
     return cv2.VideoCapture(index)
 
 
@@ -456,8 +479,10 @@ def _recv_actions(websocket):
     return result, np.asarray(result["actions"])
 
 
-# Piper's zero position is its folded rest pose.
-HOME_DEG = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# Just above the folded rest pose. All zeros drives J2 into its mechanical stop
+# (about 5 degrees on one arm), which trips the J2 driver's overcurrent fault.
+# home_deg in team_config.json overrides it.
+HOME_DEG = [0.0, 10.0, -5.0, 0.0, 0.0, 0.0]
 
 
 def go_to(target_deg, label, speed=None, freq=None):
@@ -486,8 +511,10 @@ def go_ready(speed=None, freq=None):
 
 
 def go_home(speed=None, freq=None):
-    """Fold back to HOME_DEG, the rest pose. The arm stays enabled and holds there."""
-    go_to(HOME_DEG, "home", speed=speed, freq=freq)
+    """Fold back to just above the rest pose (home_deg, default HOME_DEG). The arm stays enabled and holds there."""
+    from team_config import load
+
+    go_to(load().get("home_deg") or HOME_DEG, "home", speed=speed, freq=freq)
 
 
 def infer_once(host, port, speed=None, freq=None, ready=False):
