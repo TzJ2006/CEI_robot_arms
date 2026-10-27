@@ -37,7 +37,7 @@ flowchart LR
 - On Windows, close ArmRobot first. While it is open, this computer cannot open the CAN adapter.
 - Power the arm and plug the CAN cable into the arm's CAN port.
 - Run every command in this folder. This folder is wherever you unpacked the code, not someone else's desktop path. On Windows use `python`. On a Mac use `.venv/bin/python`.
-- Put the server account, checkpoint, and SSH alias in `team_config.json` in this same folder. When the machine or account changes, edit that file and generate the commands with `python team_config.py`.
+- Put the server account, checkpoint, and SSH alias in `team_config.json` in this same folder. Copy it from `team_config.example.json`; the real file is gitignored because the repository is public. When the machine or account changes, edit that file and generate the commands with `python team_config.py`.
 - `ssh_host` may stay empty. The program then connects with `login_host` and `remote_user`. If you already have a Host in `.ssh\config`, put that Host name in `ssh_host`.
 
 ## On a Mac
@@ -111,7 +111,7 @@ python collect.py --latest
 
 ## Run once
 
-Edit `team_config.json`. Fill in the login address, account, code directory, config name, checkpoint directory, port, and also `log_dir`, `slurm_partition`, `slurm_time`, and `slurm_mem`. See what is still empty:
+Copy `team_config.example.json` to `team_config.json` and fill in the login address, account, code directory, config name, checkpoint directory, port, and also `log_dir`, `slurm_partition`, `slurm_time`, and `slurm_mem`. See what is still empty:
 
 ```powershell
 python team_config.py show

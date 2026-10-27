@@ -31,7 +31,10 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+# Real per-person values. Gitignored: this repository is public, so the tracked file
+# is the blank team_config.example.json instead.
 CONFIG_PATH = ROOT / "team_config.json"
+EXAMPLE_PATH = ROOT / "team_config.example.json"
 STATE_PATH = ROOT / "piper_link_state.json"
 PLACEHOLDER_PORT = 8765
 WAIT_POLLS = 180
@@ -39,7 +42,9 @@ WAIT_SECONDS = 10
 
 
 def load():
-    with CONFIG_PATH.open(encoding="utf-8") as handle:
+    """team_config.json, or the blank example when a fresh clone has not copied it yet."""
+    path = CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_PATH
+    with path.open(encoding="utf-8") as handle:
         return json.load(handle)
 
 
@@ -112,10 +117,12 @@ def server_launch(config):
         return config["remote_code_dir"], command, False
     require(config, ["openpi_dir", "policy_config", "checkpoint_dir", "local_forward_port"])
     python = remote_quote(config.get("openpi_python") or ".venv/bin/python")
+    # serve_policy.py takes the subcommand first; that is the order the verified job logs use.
     command = (
-        f"{python} {shlex.join(['scripts/serve_policy.py', '--port', str(port), 'policy:checkpoint'])} "
+        f"{python} scripts/serve_policy.py policy:checkpoint "
         f"--policy.config={shlex.quote(str(config['policy_config']))} "
-        f"--policy.dir={remote_quote(config['checkpoint_dir'])}"
+        f"--policy.dir={remote_quote(config['checkpoint_dir'])} "
+        f"--port {port}"
     )
     return config["openpi_dir"], command, True
 

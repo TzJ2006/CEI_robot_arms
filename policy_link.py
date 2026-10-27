@@ -5,7 +5,7 @@ msgpack metadata first, then each client message is one msgpack observation
 and each reply is one msgpack dict. NumPy arrays use the same ``__ndarray__``
 encoding as ``openpi_client.msgpack_numpy``.
 
-The single Astra Pro color frame fills every image field. Each reply is one
+The single Astra Pro color frame is sent as ``observation/image``. Each reply is one
 action chunk. The client plays that chunk, then sends a new observation.
 Ctrl+C stops the loop. Operators use USER_GUIDE.md; protocol and code notes are in DEVELOPER_GUIDE.md.
 """
@@ -27,6 +27,12 @@ HOST = "127.0.0.1"
 PORT = 8765
 IMAGE_SHAPE = (224, 224, 3)
 COLOR_CAMERA_ID = "vid_2bc5&pid_0501"
+# The only string in meta/tasks.jsonl. The tokenizer strips and replaces underscores;
+# it does not lower-case, so this must match the dataset character for character.
+PROMPT = "put the pen into the box"
+# The fine-tune config returns 50 steps of 12 numbers: 6 delta, gripper, 5 unused.
+ACTION_HORIZON = 50
+ACTION_DIM = 12
 
 
 def pack_array(obj):
@@ -309,58 +315,55 @@ def capture_color():
     return resize_with_pad(rgb, IMAGE_SHAPE[0], IMAGE_SHAPE[1])
 
 
-def _euler_deg_to_quat_wxyz(rx, ry, rz):
-    """Intrinsic XYZ Euler degrees to a wxyz quaternion."""
-    rx, ry, rz = np.deg2rad([rx, ry, rz])
-    cx, sx = np.cos(rx / 2), np.sin(rx / 2)
-    cy, sy = np.cos(ry / 2), np.sin(ry / 2)
-    cz, sz = np.cos(rz / 2), np.sin(rz / 2)
-    return np.array(
-        [
-            cx * cy * cz + sx * sy * sz,
-            sx * cy * cz - cx * sy * sz,
-            cx * sy * cz + sx * cy * sz,
-            cx * cy * sz - sx * sy * cz,
-        ],
-        dtype=np.float32,
-    )
+def piper_train_state(state):
+    """16-d state in the order ``prepare_dataset.piper_train_state()`` writes.
 
+    End-effector position in the arm base frame in meters, quaternion **xyzw**, a
+    static base (position zero, quaternion ``0 0 0 1``), then the gripper opening
+    split into two fingers of opposite sign in meters. This is the vector the
+    pi05_piper_finetune weights were trained on, not the older RoboCasa one.
 
-def robocasa_state(state):
-    """16-d vector in the RoboCasa eval order.
-
-    eef position (3, m), eef quaternion (4, wxyz), base position (3),
-    base quaternion (4), gripper qpos (2, m). Piper has no mobile base, so the
-    base pose is the identity. The arm pose is absolute, while this checkpoint
-    was trained on a relative Panda-Omron state.
+    Dims 7:13 must be exactly zero: their std in norm_stats is zero, so the
+    normalizer's ``(x - mean) / (std + 1e-6)`` would amplify any drift a million
+    times and change the discretized state tokens.
     """
+    # Imported here because policy_step and dataset_export both import this module,
+    # so a module-level import would be circular. These are the exact functions that
+    # wrote the training set, which is what keeps evaluation and training identical.
+    from dataset_export import _quat_from_matrix
+    from policy_step import euler_to_matrix
+
     pose = state["pose_mm_deg"]
-    finger_m = np.float32(state["gripper_mm"] / 2000.0)
-    return np.concatenate(
-        [
-            np.array([pose["x"], pose["y"], pose["z"]], dtype=np.float32) / 1000.0,
-            _euler_deg_to_quat_wxyz(pose["rx"], pose["ry"], pose["rz"]),
-            np.zeros(3, dtype=np.float32),
-            np.array([1, 0, 0, 0], dtype=np.float32),
-            np.array([finger_m, finger_m], dtype=np.float32),
-        ]
-    )
+    w, x, y, z = _quat_from_matrix(euler_to_matrix(pose["rx"], pose["ry"], pose["rz"]))
+    half_m = np.float32(state["gripper_mm"] / 2000.0)
+    vector = np.zeros(16, dtype=np.float32)
+    vector[0] = float(pose["x"]) / 1000.0
+    vector[1] = float(pose["y"]) / 1000.0
+    vector[2] = float(pose["z"]) / 1000.0
+    vector[3:7] = np.array([x, y, z, w], dtype=np.float32)
+    vector[13] = 1.0
+    vector[14] = half_m
+    vector[15] = -half_m
+    return vector
 
 
 def build_observation(state, image):
-    """Package live arm feedback. Replace the keys when the checkpoint expects a different layout."""
+    """Package live arm feedback for the pi05_piper_finetune server.
+
+    Only ``observation/image`` is sent. The config feeds it to base_0_rgb and masks
+    both wrist slots, so the frame must not be copied into them. The frame is
+    already RGB: capture_color flips the BGR one, and the server does not flip.
+    """
     if not state["complete"]:
         raise RuntimeError("arm feedback is incomplete")
     if image.shape != (*IMAGE_SHAPE,) or image.dtype != np.uint8:
         raise RuntimeError(f"image must be uint8 {IMAGE_SHAPE}")
     return {
         "observation/image": image,
-        "observation/wrist_image": image.copy(),
-        "observation/right_image": image.copy(),
-        "observation/state": robocasa_state(state),
+        "observation/state": piper_train_state(state),
         # Extra key for scripted servers that command joints; model servers ignore it.
         "observation/joints_deg": np.asarray(state["joints_deg"], dtype=np.float32),
-        "prompt": "reach the pen",
+        "prompt": PROMPT,
     }
 
 
@@ -374,7 +377,7 @@ def handle_connection(websocket):
         packb(
             {
                 "protocol": "openpi-websocket",
-                "model": "black-image-placeholder",
+                "model": "zero-action-placeholder",
                 "image_shape": list(IMAGE_SHAPE),
                 "execute": False,
             }
@@ -385,21 +388,24 @@ def handle_connection(websocket):
             observation = unpackb(message)
             image = observation["observation/image"]
             _require_image(image, "observation/image")
-            _require_image(observation["observation/wrist_image"], "observation/wrist_image")
-            _require_image(observation["observation/right_image"], "observation/right_image")
+            # The fine-tune config masks the wrist slots, so these keys are optional.
+            for name in ("observation/wrist_image", "observation/right_image"):
+                if name in observation:
+                    _require_image(observation[name], name)
             proprio = observation["observation/state"]
             if getattr(proprio, "shape", None) != (16,):
                 raise ValueError(f"observation/state shape is {getattr(proprio, 'shape', None)}")
             print(
                 "received "
                 f"state={np.array2string(proprio, precision=3, separator=',')} "
-                f"image_mean={float(image.mean()):.1f}",
+                f"image_mean={float(image.mean()):.1f} "
+                f"prompt={observation.get('prompt')!r}",
                 flush=True,
             )
-            # Seven zeros stand in for six joint commands plus one gripper command.
-            # The checkpoint's real action meaning is still unknown, so execute stays false.
+            # A zero chunk of the real shape: no motion and an open gripper.
+            # execute stays false, so this is a protocol check, not a controller.
             reply = {
-                "actions": np.zeros((1, 7), dtype=np.float32),
+                "actions": np.zeros((ACTION_HORIZON, ACTION_DIM), dtype=np.float32),
                 "execute": False,
             }
         except Exception as exc:

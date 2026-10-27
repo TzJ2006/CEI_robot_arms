@@ -43,7 +43,7 @@ flowchart TB
 | `piper_client.py` | Opens candleLight (WinUSB on Windows, libusb on macOS), reads `0x2A1`–`0x2A8`, and sends gripper `0x159`, leave-teach `0x150`, enable `0x471`, MOVE P `0x151`, and end pose `0x152`–`0x154` |
 | `policy_link.py` | Builds the observation, keeps one WebSocket open, and loops inference. The camera and CAN writes are not in the same process |
 | `policy_step.py` | Integrates one action chunk into an end-effector trajectory in the base frame and writes it to CAN. It does not import `piper_sdk` at runtime |
-| `team_config.json` | Login account, SSH alias, checkpoint, and log directory. This is the only file to edit when the environment changes |
+| `team_config.json` | Login account, SSH alias, checkpoint, and log directory. Copy it from the tracked blank `team_config.example.json`; the real file is gitignored because the repository is public |
 | `team_config.py` | `run` submits the job, waits until it listens, opens one local forward, and starts continuous control. `once` starts another round while the forward is up. `down` cancels the job and closes the forward. `job` and `serve` still only print commands |
 | `simple_policy_server.py` | Scripted policy server for testing the link without a model. See [macOS and the simple server](#macos-and-the-simple-server) |
 | `USER_GUIDE.md` | Operating steps |
@@ -114,23 +114,24 @@ The table below is what the current function sends. It is not everyone's input:
 
 | Key | Value |
 | --- | --- |
-| `observation/image` | uint8, `(224, 224, 3)`, Orbbec Astra Pro color frame |
-| `observation/wrist_image` | a copy of that same frame. There is no second camera |
-| `observation/right_image` | a copy of that same frame. Some models do not need a third image; a missing key is reported by the server |
+| `observation/image` | uint8, `(224, 224, 3)`, Orbbec Astra Pro color frame, already RGB |
+| `observation/joints_deg` | float32, `(6,)`. Scripted servers command joints with it; model servers drop it |
 | `observation/state` | float32, shape `(16,)` |
-| `prompt` | the string currently in the source. Change it for the task before a run. The language instruction is not typed on the server |
+| `prompt` | the `PROMPT` constant, currently `put the pen into the box`. It must match `meta/tasks.jsonl` character for character |
 
-The order of these 16 numbers is hard-coded in `robocasa_state()`. If another model uses a different order or length, replace that function instead of reusing the table:
+One image stream only. `pi05_piper_finetune` feeds it to `base_0_rgb` and sets `image_mask` false for both wrist slots, so do not copy this frame into `observation/wrist_image` or `observation/right_image`.
+
+The order of these 16 numbers is written in `piper_train_state()`, bit-for-bit the same as `prepare_dataset.piper_train_state()` (a check script compared them and the difference was 0):
 
 | Index | Content | How this client fills it |
 | --- | --- | --- |
-| 0–2 | end-effector position, meters | Piper `x y z` millimeters divided by 1000. This is an absolute pose, not the relative quantity used in training |
-| 3–6 | end-effector quaternion, wxyz | `rx ry rz` degrees converted as intrinsic XYZ Euler angles |
-| 7–9 | base position, meters | 0. This Piper has no mobile base |
-| 10–13 | base quaternion, wxyz | `1 0 0 0` |
-| 14–15 | two finger joint positions, meters | opening in millimeters divided by 2000, written into both fingers |
+| 0–2 | end-effector position, meters, arm base frame | Piper `x y z` millimeters divided by 1000 |
+| 3–6 | end-effector quaternion, **xyzw** | `rx ry rz` degrees to a matrix with `R = Rz(rz) Ry(ry) Rx(rx)`, then to a quaternion and reordered to xyzw |
+| 7–12 | static base position and quaternion | exactly 0. Their `std` is 0, so `(x-mean)/(std+1e-6)` would amplify any offset a million times |
+| 13 | base quaternion w | 1.0 |
+| 14–15 | two finger joint positions, meters | opening in millimeters divided by 2000, opposite signs (22 mm is about `0.011, -0.011`) |
 
-Do not change the msgpack packing. With only one Astra Pro, say that all three fields contain the same frame. The 16-value order has not been checked item by item against the training-state concatenation. Run the candidate-repository check before changing models. This control loop does not use a camera extrinsic, and no hand-eye calibration was done.
+Do not change the msgpack packing. The frame must be RGB: `capture_color()` already flips OpenCV's BGR and the server does not flip it back. This control loop does not use a camera extrinsic, and no hand-eye calibration was done.
 
 ## Action contract
 

@@ -2,7 +2,7 @@
 
 A Windows or Mac computer reads an AgileX Piper and one Orbbec Astra Pro color camera, sends the observation to a policy server over an SSH tunnel, and executes each returned end-effector chunk until you press `Ctrl+C`. Server account, host, and checkpoint live in `team_config.json`. This repository does not hard-code them.
 
-本机可以是 Windows 或 Mac。它经 candleLight 读取 AgileX Piper，用 Orbbec Astra Pro 拍一张彩色图，把同一帧填进三个图像字段，经 SSH 隧道发给计算节点上的策略服务。服务每次返回一段末端增量。本机按底座坐标执行，然后重新观测，直到按 `Ctrl+C`。Mac 上用仓库里的 `.venv/bin/python`，并先按开发文档安装 libusb。
+本机可以是 Windows 或 Mac。它经 candleLight 读取 AgileX Piper，用 Orbbec Astra Pro 拍一张彩色图，把这一帧作为观测图像，经 SSH 隧道发给计算节点上的策略服务。服务每次返回一段末端增量。本机按底座坐标执行，然后重新观测，直到按 `Ctrl+C`。Mac 上用仓库里的 `.venv/bin/python`，并先按开发文档安装 libusb。
 
 操作步骤看 [`用户文档.md`](用户文档.md)，英文版是 [`USER_GUIDE.md`](USER_GUIDE.md)。改观测、动作映射或 CAN 协议时看 [`开发文档.md`](开发文档.md)，英文版是 [`DEVELOPER_GUIDE.md`](DEVELOPER_GUIDE.md)。训练数据采集的规定看 [`数据采集.md`](数据采集.md)。服务器上怎么加载微调数据看 [`服务器训练对接.md`](服务器训练对接.md)，英文版是 [`SERVER_TRAINING.md`](SERVER_TRAINING.md)。
 
@@ -46,7 +46,7 @@ Python packages used here are `numpy`, `opencv-python`, `msgpack`, and `websocke
 
 | File | Role |
 | --- | --- |
-| `team_config.json` | Login account, SSH host, checkpoint, and Slurm settings. Edit this when the environment changes |
+| `team_config.json` | Your own login account, SSH host, checkpoint, and Slurm settings. Copy it from `team_config.example.json`; it is gitignored because the repository is public |
 | `team_config.py` | `run`, `once`, `down`, `arm`, and `setup-remote`. `--server` selects `simple`, `replay`, or `openpi` |
 | `policy_link.py` | Observation, WebSocket loop, Astra Pro capture (`VID_2BC5` `PID_0501`), plus `preview`, `cameras`, `ready`, and `home` |
 | `simple_policy_server.py` | Scripted server for a link test, joint demo, or episode replay |
