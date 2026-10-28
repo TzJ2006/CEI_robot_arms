@@ -37,7 +37,7 @@ State:
 | 10:14 | `0 0 0 1`, xyzw |
 | 14:16 | Half the gripper opening, opposite signs, meters. 22 mm is about `0.011, -0.011` |
 
-This Piper reports one end-effector pose, so position and rotation come from that pose. There is no separate robosuite site and body. The gripper numbers are also not Panda's \(\pm 0.020833\). π0.5 discretizes these 16 values into language tokens. When evaluating the fine-tuned checkpoint, `build_observation()` on the robot computer has to emit this same vector. The current `robocasa_state()` is the old checkpoint's wxyz vector with both fingers the same sign. `prepare_dataset.piper_train_state()` is the training vector.
+This Piper reports one end-effector pose, so position and rotation come from that pose. There is no separate robosuite site and body. The gripper numbers are also not Panda's \(\pm 0.020833\). π0.5 discretizes these 16 values into language tokens. When evaluating the fine-tuned checkpoint, `build_observation()` on the robot computer has to emit this same vector. It now uses `policy_link.piper_train_state()`, which is bit-for-bit `prepare_dataset.piper_train_state()`: meters, xyzw, a static base, and two fingers of opposite sign. Dims 7–12 have `std` 0 and must be sent as exactly 0, or the normalizer amplifies them a million times. The prompt is `put the pen into the box` from `meta/tasks.jsonl`.
 
 Action:
 
