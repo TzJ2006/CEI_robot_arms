@@ -1,7 +1,12 @@
-"""Record one drag-teach episode. This process only reads the arm and the camera.
+"""Record one drag-teach episode. The recording only reads the arm and the camera.
 
-It does not send end-pose, joint, or gripper commands. Finish with a key:
+First the arm moves itself to the ready pose (READY_DEG) in a separate motion
+process, so every take starts where `policy_link.py once --ready` starts a
+replay; --no-ready skips that move. Then turn on drag teach and press Enter.
+Recording sends no end-pose, joint, or gripper commands. Finish with a key:
 s = success, f = failure, d = discard. Ctrl+C stores the episode as interrupted.
+A preview window shows the camera live (the saved frames stay unmarked); the
+keys work in the terminal or in that window.
 Runs on Windows (DirectShow, msvcrt) and macOS (AVFoundation, terminal in
 cbreak mode so a single key is read without Enter).
 """
@@ -16,10 +21,11 @@ import cv2
 import pandas as pd
 
 from piper_client import PiperClient
-from policy_link import open_policy_camera
+from policy_link import has_display, open_policy_camera
 
 SCHEMA_VERSION = 1
 CAMERA_ID = "vid_2bc5_pid_0501"
+PREVIEW_TITLE = "episode recorder (s success, f failure, d discard)"
 
 
 class KeyReader:
@@ -93,8 +99,20 @@ def _write_metadata(path, payload):
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
-def record_episode(task, out_dir, seconds=None):
+def _show_preview(frame, elapsed, frames):
+    """Show the frame with the elapsed time. Returns a lowercase key pressed in the window, or None."""
+    view = frame.copy()
+    cv2.putText(view, f"REC {elapsed:6.1f}s  frames {frames}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+    cv2.imshow(PREVIEW_TITLE, view)
+    code = cv2.waitKey(1) & 0xFF
+    return chr(code).lower() if code != 0xFF else None
+
+
+def record_episode(task, out_dir, seconds=None, preview=True):
     print("keys: s success, f failure, d discard. Drag the arm; this program only reads.", flush=True)
+    if preview and not has_display():
+        print("preview off: no display (over SSH, for example)", flush=True)
+        preview = False
     capture, camera_index = open_policy_camera()
     if not capture.isOpened():
         raise RuntimeError(f"could not open the Astra Pro color camera at index {camera_index}")
@@ -145,6 +163,7 @@ def record_episode(task, out_dir, seconds=None):
     success = None
     error = None
     last_image_t = None
+    window_key = None
     with KeyReader() as keys:
         try:
             while True:
@@ -160,6 +179,13 @@ def record_episode(task, out_dir, seconds=None):
                         images.append({"index": len(images), "t_image": t_image, "file": f"images/{name}"})
                     else:
                         metadata["image_write_failures"] += 1
+                    if preview:
+                        try:
+                            window_key = _show_preview(frame, t_image, len(images))
+                        except cv2.error as exc:
+                            # OpenCV built without a GUI (headless): keep recording without the window.
+                            print(f"preview off: {exc}", flush=True)
+                            preview = False
                 else:
                     metadata["camera_read_failures"] += 1
                 state = robot.read_state(timeout=0.05)
@@ -171,7 +197,8 @@ def record_episode(task, out_dir, seconds=None):
                 if seconds is not None and _clock(origin) >= seconds:
                     reason = "smoke"
                     break
-                key = keys.key()
+                key = keys.key() or window_key
+                window_key = None
                 if key is not None:
                     if key == "s":
                         reason, success = "success", True
@@ -190,6 +217,8 @@ def record_episode(task, out_dir, seconds=None):
         finally:
             capture.release()
             robot.close()
+            if preview:
+                cv2.destroyAllWindows()
 
     metadata["success"] = success
     metadata["termination_reason"] = reason
@@ -215,8 +244,16 @@ def main():
     parser.add_argument("--task", required=True)
     parser.add_argument("--out", default="episodes")
     parser.add_argument("--seconds", type=float)
+    parser.add_argument("--no-preview", action="store_true", help="record without the live camera window")
+    parser.add_argument("--no-ready", action="store_true", help="record from wherever the arm is, without moving to the ready pose first")
     args = parser.parse_args()
-    record_episode(args.task, args.out, args.seconds)
+    if not args.no_ready:
+        from policy_link import go_ready
+
+        # Runs in its own motion process, which has released the adapter before the recording opens it.
+        go_ready()
+        input("turn on drag teach, then press Enter to start recording")
+    record_episode(args.task, args.out, args.seconds, preview=not args.no_preview)
 
 
 if __name__ == "__main__":

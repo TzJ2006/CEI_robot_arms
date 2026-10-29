@@ -58,6 +58,14 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 
 `--freq` is how many times per second the joint target changes (default 100; 20 is the old stepwise behavior). `--speed` is the joint speed percent (default `joint_speed` in `team_config.json`). Each chunk prints the values it used.
 
+### Replay one recording on this computer
+
+```bash
+.venv/bin/python policy_link.py replay episodes/episode_...
+```
+
+Without a folder it plays the newest recording. No server is needed. A window shows the camera live (`--no-preview` hides it; over SSH there is no window). The arm unfolds to the ready pose (where every recording starts), moves slowly to the recording's first pose, plays it once, prints `replay_done`, and returns to the ready pose. Add `--loop` to keep replaying it, back through the ready pose each time, until `Ctrl+C`. The gripper only fully closes or fully opens: once the recording closed it by about a third of its widest opening, replay closes it to 0 mm (stopping on the object). Joints dragged past their limits (J5 beyond 70 degrees) are held at the limit. Leave drag-teach first. Recordings made on a Mac replay the same on Linux: copy the episode folder over.
+
 ### Replay a recording from the server
 
 1. Record a demonstration as in [Record a demonstration](#record-a-demonstration). Any episode can be replayed, not only ones marked `s`.
@@ -86,13 +94,13 @@ For joint-space chunks (the demo server), two flags tune smoothness and can be c
 
 ## Record a demonstration
 
-This only stores a person dragging the arm. The program reads the arm and the camera and never moves the arm. Turn on drag-teach, then run this in this folder with the task sentence in quotes (on a Mac use `.venv/bin/python` and `/` in paths):
+This stores a person dragging the arm. First the program moves the arm to the ready pose, so every recording (and its replay) starts from the same place; add `--no-ready` to skip that. Then it asks you to turn on drag-teach and press Enter. While recording it only reads the arm and the camera, and a window shows the camera live (`--no-preview` hides it; over SSH there is no window). Run this in this folder with the task sentence in quotes (on a Mac use `.venv/bin/python` and `/` in paths):
 
 ```powershell
 python episode_recorder.py --task "put the pen in the box"
 ```
 
-When the attempt is over, press one key in the same window (no Enter needed):
+When the attempt is over, press one key in the terminal or the camera window (no Enter needed):
 
 | Key | Result |
 | --- | --- |

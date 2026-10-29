@@ -71,6 +71,7 @@ class PiperClient:
     def __init__(self):
         self._arm = None
         self._gripper = None
+        self._gripper_max = None
 
     def __enter__(self):
         self.connect()
@@ -179,11 +180,14 @@ class PiperClient:
         return faults
 
     def gripper_max_mm(self, timeout=0.4):
-        """Query the configured stroke. Falls back to 70 mm when the reply is absent."""
-        reply = self._gripper.get_gripper_teaching_pendant_param(timeout=timeout)
-        if reply is not None and round(reply.msg.max_range_config * 1000) in (70, 100):
-            return float(round(reply.msg.max_range_config * 1000))
-        return 70.0
+        """Query the configured stroke once per connection. Falls back to 70 mm when the reply is absent."""
+        if self._gripper_max is None:
+            reply = self._gripper.get_gripper_teaching_pendant_param(timeout=timeout)
+            if reply is not None and round(reply.msg.max_range_config * 1000) in (70, 100):
+                self._gripper_max = float(round(reply.msg.max_range_config * 1000))
+            else:
+                return 70.0
+        return self._gripper_max
 
     def move_gripper(self, target_mm, effort=1000, timeout=4.0, tolerance_mm=1.0):
         """Command the gripper only. Effort is 0.001 N·m. Does not change the zero point."""

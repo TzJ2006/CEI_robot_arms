@@ -448,8 +448,12 @@ class PiperUsbBus(can.BusABC):
             remaining = 0.01 if deadline is None else deadline - time.perf_counter()
             if remaining <= 0:
                 return None, False
+            transport = self._transport
+            if transport is None:
+                # Shut down while pyAgxArm's read thread was still polling.
+                return None, False
             with self._lock:
-                raw = self._transport.read(wait_ms=max(1, min(10, remaining * 1000)))
+                raw = transport.read(wait_ms=max(1, min(10, remaining * 1000)))
             if raw is None or len(raw) < 20:
                 continue
             echo, can_id, dlc = struct.unpack_from("<IIB", raw)
@@ -547,6 +551,9 @@ def create_piper_arm(firmware="auto", **config):
         deadline = time.time() + 2.0
         while probe.get_fps() <= 0 and time.time() < deadline:
             time.sleep(0.05)
+        if probe.get_fps() <= 0:
+            # With nothing else on the bus, writes are never acknowledged and time out on USB.
+            raise RuntimeError("no CAN frames from the arm: check that it is powered on and its CAN cable reaches this adapter")
         for _ in range(3):
             info = probe.get_firmware(timeout=1.5)
             if info:
