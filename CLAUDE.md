@@ -10,12 +10,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 没有测试套件、没有构建步骤、没有依赖清单文件。运行时依赖：`numpy`、`msgpack`、`websockets>=13`、`opencv-python`（`cv2`）、`python-can`、官方 `pyAgxArm`（`pip install "git+https://github.com/agilexrobotics/pyAgxArm.git"`），录制/导出还要 `pandas`、`pyarrow`；macOS 还需要 `pyusb`、`pyobjc-framework-AVFoundation` 和 `brew install libusb`。macOS 上按 USB ID 自动找 Astra Pro（复现 OpenCV 的 uniqueID 排序），`camera_index` 非空时覆盖；运行命令的 App 需要相机权限。Mac 上用仓库内的 `.venv`（`.venv/bin/python`）。
 
-当前目标路线（第一步已实现，未上实机）：Mac 直连机械臂 → athena（`ssh athena`，Duke 集群，可能需要 VPN）上跑策略服务器 → 之后采集真实数据、训练模型完成 memory 任务。
+本机可以是 Windows 或 macOS，直连机械臂，经 SSH 隧道连集群上的策略服务器。采集用 `collect.py`。Mac 上命令用 `.venv/bin/python`。
 
 ## 常用命令（在本目录下运行；Mac 上把 `python` 换成 `.venv/bin/python`）
 
 ```powershell
-python team_config.py show      # 列出 team_config.json 里还没填的键
+python team_config.py show      # 列出还没填的键（真实值在 team_config.json，它不入库）
 python team_config.py arm       # 只读臂状态，不动臂（检查是否在线）
 python team_config.py run       # 提交/复用 slurm 任务 serve-policy，等 "listening on"，开 ssh -L，启动连续控制
 python team_config.py once      # 服务器和转发仍在时再跑一轮连续控制
@@ -27,6 +27,8 @@ python episode_recorder.py --task "..."  # 先自动移到 READY_DEG，再拖动
 python policy_link.py replay [episodes/episode_...] [--loop]  # --loop 一直重复直到 Ctrl+C； 本机回放一条（默认最新），前后都到 READY_DEG，不需要服务器，相机只做预览窗口（会动臂）
 python episode_check.py episodes/episode_...   # 时间线和曲线检查
 python dataset_export.py episodes/episode_...  # 成功的 episode 导出 0.05 s 网格的 12 维动作和 mask；--self-check 不连臂
+python prepare_dataset.py          # 把所有成功 episode 整理成 datasets/piper_finetune；--self-check 不连臂
+python collect.py --task "..."     # 录一条，s 之后检查、导出并重建微调数据集
 python team_config.py run --server replay|openpi [--ready]  # 覆盖 server_mode；--ready 先展开到 READY_DEG
 python policy_link.py ready     # 只把臂展开到准备姿态（会动臂）
 python policy_link.py home      # 收回到休息位稍上方 home_deg（默认 J2 10°、J3 −5°；会动臂）
@@ -43,7 +45,7 @@ python check_candidate_repo.py PATH_TO_REPO   # 换模型前检查候选策略�
 
 ## 架构（跨文件才能看清的部分）
 
-- `team_config.py` 是编排层：通过 SSH 在登录节点提交/复用名为 `serve-policy` 的 slurm 任务，轮询日志直到出现 `listening on`，用 `scontrol` 取 `NodeAddr`，在单独窗口（标题 `piper-link`）开 `ssh -L` 指向计算节点，然后调用 `policy_link.py once`。所有服务器路径、账号、checkpoint 只来自 `team_config.json`；缺字段时报出要填的键，绝不复用别人的路径。
+- `team_config.py` 是编排层：通过 SSH 在登录节点提交/复用名为 `serve-policy` 的 slurm 任务，轮询日志直到出现 `listening on`，用 `scontrol` 取 `NodeAddr`，在单独窗口（标题 `piper-link`）开 `ssh -L` 指向计算节点，然后调用 `policy_link.py once`。所有服务器路径、账号、checkpoint 只来自 `team_config.json`（该文件在 `.gitignore` 里，入库的是空模板 `team_config.example.json`）。缺字段时报出要填的键，绝不复用别人的路径。
 - `policy_link.py` 持有整个循环的 WebSocket（与 `openpi_client` 线格式相同：先收一条 metadata，ndarray 用 `__ndarray__` + bytes 键 `data/dtype/shape` 编码）。每轮：`read_state()`（不完整则 raise 不发送）→ `LiveCamera.read_bgr()`（常开的相机，取调用后的第一帧，pad 到 224×224）→ `build_observation()` → 等推理（最长 600 s，字符串回复即服务端异常）→ 把动作交给**常驻子进程** `policy_step.py worker`（`MotionWorker`，stdin/stdout 传 pickle，打印走 stderr）执行。读状态也经它。
 - **相机与 CAN 写入不能在同一进程**（会以 `3221225477` access violation 退出）。`policy_link.py` 只持有相机，适配器只由运动子进程打开，每次运行只连一次（以前每轮重连+识别固件+0.5 s 停稳，两轮间停 1–3 s）。不要把这两部分合并回一个进程。
 - `policy_step.py` 的 `action_waypoints()` 把 12 维输出解释为基座系下末端增量：0–2 平移 ×0.05 m，3–5 轴角 ×0.5 rad 左乘，6 为夹爪（≥0.5 闭合到 0 mm，否则张开到 `gripper_max_mm()`），7–11 丢弃。每步按 0.05 s、速度 50% 发送 MOVE P 位姿。欧拉约定与 `piper_fk` 一致：`R = Rz·Ry·Rx`。
@@ -60,7 +62,7 @@ python check_candidate_repo.py PATH_TO_REPO   # 换模型前检查候选策略�
 ## 模型相关的契约（换模型时首先要改的地方）
 
 observation 和 action 的含义随加载的 checkpoint 变化，不是本仓库的固定标准：
-- 输入：`build_observation()` 与 `robocasa_state()`（16 维 state 的顺序硬编码；三个图像字段目前是同一帧的拷贝）。`prompt` 字符串写在 `policy_link.py` 源码里，运行前按任务修改。
+- 输入：`build_observation()` 与 `piper_train_state()`（16 维 state 的顺序硬编码，与 `prepare_dataset.piper_train_state()` 一致；只发 `observation/image` 一路）。`prompt` 是 `policy_link.py` 的 `PROMPT` 常量，当前是 `put the pen into the box`，换任务时改它和 `meta/tasks.jsonl`。
 - 输出：`policy_step.py` 的 `action_waypoints()`。`simple_policy_server.py` 生成的动作也依赖这个含义。
 - 换模型前先跑 `check_candidate_repo.py` 并读它指出的文件，弄清动作类型/单位/相机字段之前，不要把输出写到 `0x155`（关节）或 `0x159`。**不要把 12 维输出当作 6 个关节角写到 `0x155`。**
 

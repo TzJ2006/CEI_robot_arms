@@ -1,7 +1,7 @@
 """Align one recorded episode onto the 0.05 s grid and write 12-d actions.
 
-The 16-d observation state is not exported. Its order is not confirmed against
-the training concatenation. Policy returns are not read as demonstration labels.
+The 16-d training state is not written into this grid. prepare_dataset.py builds
+it from the grid. Policy returns are not read as demonstration labels.
 """
 
 import argparse
@@ -16,7 +16,8 @@ from policy_step import euler_to_matrix
 CONTROL_DT_S = 0.05
 POSITION_SCALE_M = 0.05
 ROTATION_SCALE_RAD = 0.5
-GRIPPER_CLOSE_MM = 5.0
+# A grasp on this gripper sits near 22 mm. 28 mm separates that cluster from the open poses.
+GRIPPER_CLOSE_MM = 28.0
 STALE_S = 0.15
 ACTION_NAMES = (
     "dx_m_over_dt",
@@ -253,7 +254,7 @@ def export_episode(episode_dir):
         "rotation_scale_rad": ROTATION_SCALE_RAD,
         "gripper_close_mm": GRIPPER_CLOSE_MM,
         "action_source": "measured_trajectory",
-        "state_16d": "withheld until the training concatenation is confirmed",
+        "state_16d": "not in this grid; prepare_dataset.py writes the 16-d training state",
         "physical_camera_count": 1,
         "flagged_rows": int((table["flags"] != "").sum()),
         "grid_rows": int(len(table)),

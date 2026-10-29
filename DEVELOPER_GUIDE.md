@@ -45,13 +45,14 @@ flowchart TB
 | `piper_can_bus.py` | Picks the CAN backend for this platform and the firmware profile, and drives the adapter over USB on Windows and macOS. See [Official SDK (pyAgxArm)](#official-sdk-pyagxarm) |
 | `policy_link.py` | Builds the observation, keeps one WebSocket open, and loops inference. The camera and CAN writes are not in the same process |
 | `policy_step.py` | Integrates one action chunk into an end-effector trajectory in the base frame and writes it to CAN |
-| `team_config.json` | Login account, SSH alias, checkpoint, and log directory. This is the only file to edit when the environment changes |
+| `team_config.json` | Login account, SSH alias, checkpoint, and log directory. Copy it from the tracked blank `team_config.example.json`; the real file is gitignored because the repository is public |
 | `team_config.py` | `run` submits the job, waits until it listens, opens one local forward, and starts continuous control. `once` starts another round while the forward is up. `down` cancels the job and closes the forward. `job` and `serve` still only print commands |
 | `simple_policy_server.py` | Scripted policy server for testing the link without a model. See [macOS and the simple server](#macos-and-the-simple-server) |
 | `USER_GUIDE.md` | Operating steps |
 | `用户文档.md` | Operating steps in Chinese |
 | `_can_listen.py` | Capture that receives only and transmits nothing. The log is `_can_listen_log.txt` in this directory |
 | `check_candidate_repo.py` | After a candidate policy repository arrives, search its config, actions, normalization, cameras, and any Piper execution code |
+| `prepare_dataset.py` | Pack successful demonstrations into `datasets/piper_finetune`. Server changes are in `SERVER_TRAINING.md` |
 
 Paths are relative to the directory that contains this code. Do not put someone's desktop absolute path into the docs or into new code. Server paths come from `team_config.json`.
 
@@ -128,14 +129,14 @@ Putting the camera and CAN writes in one process exited with an access violation
 
 `policy_link.py` uses the same WebSocket as `openpi_client`: after connect, the server sends one msgpack metadata message; each later observation is one msgpack message, and each reply is one msgpack message. NumPy arrays travel in an `__ndarray__` map whose keys are the bytes `data`, `dtype`, and `shape`.
 
-Server directory, account, host name, and model name live only in each person's `team_config.json`. If a field is missing, `team_config.py` names the keys to fill and does not reuse someone else's paths. Operators run `python team_config.py run`. It submits or reuses a job named `serve-policy` on the login node, waits until the log contains `listening on`, reads `NodeAddr` from `scontrol`, opens one Windows `ssh -L` to that address, then calls `policy_link.py once`. `down` cancels that user's `serve-policy` jobs and stops the matching local `ssh -N`. `job` and `serve` still only print text for someone who needs to start the server by hand.
+Server directory, account, host name, and model name live only in each person's `team_config.json`. If a field is missing, `team_config.py` names the keys to fill and does not reuse someone else's paths. Operators run `python team_config.py run`. It submits or reuses a job named `serve-policy` on the login node, waits until the log contains `listening on`, reads `NodeAddr` from `scontrol`, opens one local `ssh -L` to that address, then calls `policy_link.py once`. On Windows the forward stays in its own window. On macOS it runs in the background, and `down` stops it with `pkill`. `down` cancels that user's `serve-policy` jobs and stops the matching local `ssh -N`. `job` and `serve` still only print text for someone who needs to start the server by hand.
 
 Order inside `once`:
 
 1. Retry the connection to `ws://host:port` up to 50 times, with a 2-second handshake timeout. `python team_config.py once` and `python policy_link.py once` without `--port` both use `local_forward_port`. `python policy_link.py serve` still listens on `127.0.0.1:8765` by default, which is the local placeholder server.
 2. Receive metadata within 30 seconds and print `server_connected`.
 3. Ask the motion worker for `read_state()`. If it is incomplete, raise and do not send.
-4. `LiveCamera.read_bgr()` returns the first frame captured after the call and `model_image()` turns it into one RGB frame from the Orbbec Astra Pro color camera (USB `VID_2BC5` `PID_0501`) and pads it to 224×224. Other cameras on the same computer are not selected. `build_observation(state, image)` copies that same frame into all three image fields.
+4. `LiveCamera.read_bgr()` returns the first frame captured after the call from the Orbbec Astra Pro color camera (USB `VID_2BC5` `PID_0501`), and `model_image()` turns it into RGB padded to 224×224. Other cameras on the same computer are not selected. `build_observation(state, image)` sends it as `observation/image`.
 5. Send the observation and print `image_mean` and `waiting_for_inference`.
 6. Wait up to 600 seconds. If the reply is a string, raise it as a `RuntimeError`. That is how an OpenPI server returns an exception.
 7. Print `actions_shape`. One verified return was `(50, 12)`. Then the motion worker executes the whole chunk and prints `pose_sent` plus the state read right afterward (no settle wait).
@@ -151,23 +152,24 @@ The table below is what the current function sends. It is not everyone's input:
 
 | Key | Value |
 | --- | --- |
-| `observation/image` | uint8, `(224, 224, 3)`, Orbbec Astra Pro color frame |
-| `observation/wrist_image` | a copy of that same frame. There is no second camera |
-| `observation/right_image` | a copy of that same frame. Some models do not need a third image; a missing key is reported by the server |
+| `observation/image` | uint8, `(224, 224, 3)`, Orbbec Astra Pro color frame, already RGB |
+| `observation/joints_deg` | float32, `(6,)`. Scripted servers command joints with it; model servers drop it |
 | `observation/state` | float32, shape `(16,)` |
-| `prompt` | the string currently in the source. Change it for the task before a run. The language instruction is not typed on the server |
+| `prompt` | the `PROMPT` constant, currently `put the pen into the box`. It must match `meta/tasks.jsonl` character for character |
 
-The order of these 16 numbers is hard-coded in `robocasa_state()`. If another model uses a different order or length, replace that function instead of reusing the table:
+One image stream only. `pi05_piper_finetune` feeds it to `base_0_rgb` and sets `image_mask` false for both wrist slots, so do not copy this frame into `observation/wrist_image` or `observation/right_image`.
+
+The order of these 16 numbers is written in `piper_train_state()`, bit-for-bit the same as `prepare_dataset.piper_train_state()` (a check script compared them and the difference was 0):
 
 | Index | Content | How this client fills it |
 | --- | --- | --- |
-| 0–2 | end-effector position, meters | Piper `x y z` millimeters divided by 1000. This is an absolute pose, not the relative quantity used in training |
-| 3–6 | end-effector quaternion, wxyz | `rx ry rz` degrees converted as intrinsic XYZ Euler angles |
-| 7–9 | base position, meters | 0. This Piper has no mobile base |
-| 10–13 | base quaternion, wxyz | `1 0 0 0` |
-| 14–15 | two finger joint positions, meters | opening in millimeters divided by 2000, written into both fingers |
+| 0–2 | end-effector position, meters, arm base frame | Piper `x y z` millimeters divided by 1000 |
+| 3–6 | end-effector quaternion, **xyzw** | `rx ry rz` degrees to a matrix with `R = Rz(rz) Ry(ry) Rx(rx)`, then to a quaternion and reordered to xyzw |
+| 7–12 | static base position and quaternion | exactly 0. Their `std` is 0, so `(x-mean)/(std+1e-6)` would amplify any offset a million times |
+| 13 | base quaternion w | 1.0 |
+| 14–15 | two finger joint positions, meters | opening in millimeters divided by 2000, opposite signs (22 mm is about `0.011, -0.011`) |
 
-Do not change the msgpack packing. With only one Astra Pro, say that all three fields contain the same frame. The 16-value order has not been checked item by item against the training-state concatenation. Run the candidate-repository check before changing models. This control loop does not use a camera extrinsic, and no hand-eye calibration was done.
+Do not change the msgpack packing. The frame must be RGB: `model_image()` already flips OpenCV's BGR and the server does not flip it back. This control loop does not use a camera extrinsic, and no hand-eye calibration was done.
 
 ## Action contract
 
@@ -181,7 +183,7 @@ Do not change the msgpack packing. With only one Astra Pro, say that all three f
 | 7–10 | base and torso | This Piper has no such mechanisms, so these values are dropped |
 | 11 | control mode | Not a length; dropped |
 
-Every returned step becomes a waypoint and is sent at 0.05 s with speed 50%. A chunk is no longer cut off at 10 mm or 5 degrees. After the chunk, `policy_link.py` requests the next one with a new image and state. Verified: after leaving teach mode, the arm followed one chunk's final pose, with `motion=0`.
+`execute_steps` in `team_config.json` keeps only the first N steps of each chunk (empty means all of them). `ee_delta_scale` scales translation and rotation (empty means 1). Before any frame is sent, `check_limits()` refuses a chunk that reaches farther than `max_chunk_shift_mm` from the start pose. Each kept step is sent at 0.05 s with speed 50%. After the chunk, `policy_link.py` requests the next one with a new image and state. Verified: after leaving teach mode, the arm followed one chunk's final pose, with `motion=0`.
 
 ## macOS and the simple server
 
@@ -238,7 +240,7 @@ Replay uses the drag-teach episodes from `episode_recorder.py` (see `数据采�
 `policy_link.py home` uses the same `go_to()` path to fold to `HOME_DEG` (all zeros, the rest pose). `policy_link.py ready` and `once --ready` unfold to `READY_DEG` with joint targets before an `ee_delta` model, since end-pose targets from the folded pose are rejected.
 
 
-The adapter is a candleLight, `VID_1D50` / `PID_606F`, WinUSB, interface GUID `{c15b4308-04d3-11e6-b3ea-6057189e6443}`, CAN clock 48 MHz.
+The adapter is a candleLight, `VID_1D50` / `PID_606F`, CAN clock 48 MHz. On Windows it is WinUSB, interface GUID `{c15b4308-04d3-11e6-b3ea-6057189e6443}`. On macOS, libusb opens the same VID/PID.
 
 These make `CreateFile` return error 5:
 
